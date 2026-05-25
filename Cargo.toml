@@ -1,0 +1,23 @@
+[package]
+name = "de-novo-antigen-binder"
+version = "0.1.0"
+edition = "2021"
+description = "Physics-based generative de novo antibody design engine — pure Rust, no ML deps"
+license = "MIT"
+
+[[bin]]
+name = "binder"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.10"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
