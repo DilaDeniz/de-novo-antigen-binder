@@ -16,15 +16,18 @@ A population of 64 independent candidates runs in parallel on all CPU cores (via
 
 ## Energy Function
 
-$$E_\text{total} = \sum_{i \in \text{antigen}} \sum_{j \in \text{antibody}} \left[ V_\text{LJ}(r_{ij}) + V_\text{Coulomb}(r_{ij}) + V_\text{hydro}(r_{ij}) \right]$$
+```
+E_total = SUM over all (antigen_i, antibody_j) pairs:
+            V_LJ(r) + V_Coulomb(r) + V_hydro(r)
+```
 
-| Term | Formula |
-|------|---------|
-| Lennard-Jones | $4\varepsilon_{ij}\left[(\sigma_{ij}/r)^{12} - (\sigma_{ij}/r)^{6}\right]$ |
-| Coulomb | $k \cdot q_i q_j / r$ — constant $k = 332\ \text{kcal mol}^{-1}\text{Å e}^{-2}$ |
-| Hydrophobic | $-0.5\ \text{kcal/mol}$ per hydrophobic–hydrophobic pair within 6 Å |
+| Term | Expression | Notes |
+|------|------------|-------|
+| Lennard-Jones | `4·ε·[(σ/r)^12 − (σ/r)^6]` | sterics + weak attraction |
+| Coulomb | `332·q1·q2 / r` kcal/mol | 332 = k in AMBER units (Å, e⁻) |
+| Hydrophobic | `−0.5 kcal/mol` per pair | hydrophobic–hydrophobic pairs within 6 Å |
 
-LJ parameters use Lorentz-Berthelot mixing rules ($\varepsilon_{ij} = \sqrt{\varepsilon_i \varepsilon_j}$, $\sigma_{ij} = (\sigma_i + \sigma_j)/2$). All cutoff checks use $r^2$ to avoid unnecessary square roots.
+LJ parameters use Lorentz-Berthelot mixing rules: `ε_ij = sqrt(ε_i · ε_j)`, `σ_ij = (σ_i + σ_j) / 2`. Cutoff checks use `r²` throughout to avoid unnecessary square roots.
 
 ## Architecture
 
@@ -121,4 +124,4 @@ This is a **residue-level coarse-grained model** (one point per residue at the C
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
