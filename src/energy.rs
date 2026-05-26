@@ -5,6 +5,7 @@
 /// is computed once per pair and reused.
 use crate::allatom::AtomCloud;
 use crate::atom::ResidueCloud;
+use crate::solvation;
 use crate::spatial::SpatialHashGrid;
 
 // Coulomb constant in kcal/mol·Å·e⁻² (= 332.0 in common AMBER/CHARMM units)
@@ -235,6 +236,9 @@ pub fn interaction_energy_atoms(antigen: &AtomCloud, antibody: &AtomCloud) -> f3
             }
         }
     }
+
+    // EEF1 implicit solvation cross-term (burial free energy at the interface)
+    total += solvation::solvation_interaction(antigen, antibody);
     total
 }
 

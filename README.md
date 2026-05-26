@@ -215,7 +215,7 @@ Release build: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`.
 cargo test
 ```
 
-8 unit tests:
+10 unit tests:
 
 | Test | What it checks |
 |------|---------------|
@@ -227,19 +227,29 @@ cargo test
 | `rotamer_lib_non_empty_for_ile` | Ile rotamer library has 5 entries |
 | `build_ala_residue` | ALA has exactly 5 heavy atoms |
 | `build_gly_residue` | GLY has exactly 4 heavy atoms (no Cβ) |
+| `hydrophobic_burial_favorable` | EEF1 pair_solvation < 0 for two hydrophobic atoms |
+| `polar_burial_unfavorable` | EEF1 pair_solvation > 0 for two polar atoms |
 
 ---
 
-## Limitations
+## Model accuracy
 
-- Residue-level coarse-grained mode uses one Cα point per residue — it is a
-  fast structural sketch, not all-atom accuracy.
-- All-atom mode uses ideal backbone geometry (no backbone torsion sampling);
-  backbone flexibility requires additional MD relaxation.
-- No explicit solvent or GBSA solvation — complement with MM-GBSA or explicit
-  MD for binding free energy estimates.
-- For real drug discovery workflows, validate experimentally and with all-atom
-  MD relaxation (e.g., OpenMM, GROMACS).
+The coarse-grained mode (default) uses one Cα per residue and is best suited
+for fast candidate generation.  The all-atom mode (`--allatom`) addresses the
+physics more rigorously:
+
+| Feature | Coarse-grained | All-atom |
+|---------|---------------|----------|
+| Representation | 1 Cα/residue | All heavy atoms (N, CA, C, O, CB, side-chain) |
+| Force field | Residue-level LJ + Coulomb | AMBER99SB-ildn (per-atom ε, Rmin, charge) |
+| Side-chain conformation | — | Dunbrack rotamer MC + NERF reconstruction |
+| Backbone flexibility | — | phi/psi torsion MC (Rodrigues rotation) |
+| Solvation | — | EEF1 implicit solvation (burial free energy) |
+| Population | 64 candidates | 64 CPU / 1024 GPU |
+
+For binding free energy estimates, the all-atom AMBER + EEF1 energy is
+suitable as a triage metric.  All-atom MD relaxation (OpenMM, GROMACS) and
+experimental validation remain the gold standard before advancing candidates.
 
 ---
 

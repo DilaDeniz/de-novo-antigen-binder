@@ -44,6 +44,10 @@ const T_COLD:     f32 = 0.02;
 const MUTATION_P: f32 = 0.08;
 /// Probability of a rotamer MC move vs. amino-acid mutation.
 const ROTAMER_MOVE_P: f32 = 0.12;
+/// Probability of a backbone phi/psi torsion MC move per residue per step.
+const BACKBONE_MOVE_P: f32 = 0.04;
+/// Maximum phi/psi perturbation per MC move (degrees).
+const MAX_TORSION_DEG: f32 = 15.0;
 const INIT_RADIUS:    f32 = 20.0;
 const MAX_DISP:       f32 = 2.0;
 const RESTRAINT_K:    f32 = 0.02;
@@ -328,6 +332,22 @@ fn allatom_diffusion_step(
                 if !accept {
                     ab.mutate_residue(r, old_aa, old_chi);
                 }
+            }
+        }
+    }
+
+    // Backbone phi/psi torsion MC moves
+    for r in 0..n {
+        if rng.gen::<f32>() < BACKBONE_MOVE_P {
+            let delta = rng.gen_range(-MAX_TORSION_DEG..MAX_TORSION_DEG).to_radians();
+            let do_phi = rng.gen::<bool>();
+            let old_e = residue_contribution_allatom(r, ab, &ag_ca);
+            if do_phi { ab.perturb_phi(r, delta); } else { ab.perturb_psi(r, delta); }
+            let new_e = residue_contribution_allatom(r, ab, &ag_ca);
+            let accept = (new_e - old_e) <= 0.0
+                || rng.gen::<f32>() < (-(new_e - old_e) / temp).exp();
+            if !accept {
+                if do_phi { ab.perturb_phi(r, -delta); } else { ab.perturb_psi(r, -delta); }
             }
         }
     }

@@ -8,6 +8,7 @@ mod error;
 mod gpu;
 mod pdb;
 mod rotamer;
+mod solvation;
 mod spatial;
 
 use error::BinderError;
