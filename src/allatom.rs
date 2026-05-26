@@ -6,7 +6,7 @@
 ///
 /// `AtomProtein` — residue bookkeeping layered on top of an `AtomCloud`.
 ///                 Owns chi angles and exposes residue-level mutation/rotamer APIs.
-use crate::amber::{topology, AMBER_NB};
+use crate::amber::{topology, AtomType, AMBER_NB};
 use crate::atom::AminoAcid;
 use crate::rotamer::{build_side_chain, rotamers, Rotamer};
 
@@ -23,6 +23,8 @@ pub struct AtomCloud {
     pub epsilon:    Vec<f32>,
     /// 1 = hydrophobic C, 0 otherwise.
     pub hydrophobic: Vec<u8>,
+    /// AMBER atom type index (AtomType as u8) — used for EEF1 solvation lookup.
+    pub atom_type:  Vec<u8>,
     /// Which residue (in AtomProtein::amino_acid) this atom belongs to.
     pub residue_idx: Vec<u32>,
 }
@@ -32,7 +34,7 @@ impl AtomCloud {
         Self {
             x: Vec::new(), y: Vec::new(), z: Vec::new(),
             charge: Vec::new(), r_min_half: Vec::new(), epsilon: Vec::new(),
-            hydrophobic: Vec::new(), residue_idx: Vec::new(),
+            hydrophobic: Vec::new(), atom_type: Vec::new(), residue_idx: Vec::new(),
         }
     }
 
@@ -41,7 +43,8 @@ impl AtomCloud {
             x: Vec::with_capacity(cap), y: Vec::with_capacity(cap),
             z: Vec::with_capacity(cap), charge: Vec::with_capacity(cap),
             r_min_half: Vec::with_capacity(cap), epsilon: Vec::with_capacity(cap),
-            hydrophobic: Vec::with_capacity(cap), residue_idx: Vec::with_capacity(cap),
+            hydrophobic: Vec::with_capacity(cap), atom_type: Vec::with_capacity(cap),
+            residue_idx: Vec::with_capacity(cap),
         }
     }
 
@@ -52,7 +55,7 @@ impl AtomCloud {
     pub fn is_empty(&self) -> bool { self.x.is_empty() }
 
     pub fn push_atom(&mut self, pos: [f32; 3], charge: f32, r_min_half: f32,
-                     epsilon: f32, hydrophobic: u8, res_idx: u32) {
+                     epsilon: f32, hydrophobic: u8, atype: AtomType, res_idx: u32) {
         self.x.push(pos[0]);
         self.y.push(pos[1]);
         self.z.push(pos[2]);
@@ -60,6 +63,7 @@ impl AtomCloud {
         self.r_min_half.push(r_min_half);
         self.epsilon.push(epsilon);
         self.hydrophobic.push(hydrophobic);
+        self.atom_type.push(atype as u8);
         self.residue_idx.push(res_idx);
     }
 
@@ -161,7 +165,7 @@ impl AtomProtein {
             let nb = &AMBER_NB[rat.atom_type as usize];
             self.atoms.push_atom(
                 backbone[k], rat.charge, nb.r_min_half, nb.epsilon,
-                rat.hydrophobic, res_idx,
+                rat.hydrophobic, rat.atom_type, res_idx,
             );
         }
 
@@ -180,7 +184,7 @@ impl AtomProtein {
             let nb = &AMBER_NB[rat.atom_type as usize];
             self.atoms.push_atom(
                 *pos, rat.charge, nb.r_min_half, nb.epsilon,
-                rat.hydrophobic, res_idx,
+                rat.hydrophobic, rat.atom_type, res_idx,
             );
         }
 
@@ -279,6 +283,7 @@ impl AtomProtein {
         let mut nrm = Vec::with_capacity(n_new);
         let mut ne  = Vec::with_capacity(n_new);
         let mut nh  = Vec::with_capacity(n_new);
+        let mut nat = Vec::with_capacity(n_new);
         let mut nri = Vec::with_capacity(n_new);
 
         for k in 0..n_new {
@@ -295,6 +300,7 @@ impl AtomProtein {
             nrm.push(nb.r_min_half);
             ne.push(nb.epsilon);
             nh.push(rat.hydrophobic);
+            nat.push(rat.atom_type as u8);
             nri.push(res_idx);
         }
 
@@ -308,6 +314,7 @@ impl AtomProtein {
         self.atoms.r_min_half.splice(start..end, nrm);
         self.atoms.epsilon.splice(start..end, ne);
         self.atoms.hydrophobic.splice(start..end, nh);
+        self.atoms.atom_type.splice(start..end, nat);
         self.atoms.residue_idx.splice(start..end, nri);
 
         // Update bookkeeping
@@ -333,6 +340,80 @@ impl AtomProtein {
 
 impl Default for AtomProtein {
     fn default() -> Self { Self::new() }
+}
+
+// ── Backbone torsion perturbation ─────────────────────────────────────────────
+
+impl AtomProtein {
+    /// Rotate all atoms from C onward (C, O, CB, side-chain) around the N→CA
+    /// bond axis by `delta_rad`.  Perturbs the phi backbone torsion.
+    pub fn perturb_phi(&mut self, r: usize, delta_rad: f32) {
+        let range = self.atom_range(r);
+        if range.len() < 3 { return; }
+        let n_idx  = range.start;
+        let ca_idx = range.start + 1;
+        let n  = self.atom_xyz(n_idx);
+        let ca = self.atom_xyz(ca_idx);
+        let axis = norm3(sub3(ca, n));
+        for i in (ca_idx + 1)..range.end {
+            let p = self.atom_xyz(i);
+            let r = rodrigues(p, ca, axis, delta_rad);
+            self.atoms.x[i] = r[0];
+            self.atoms.y[i] = r[1];
+            self.atoms.z[i] = r[2];
+        }
+    }
+
+    /// Rotate the carbonyl O around the CA→C bond axis by `delta_rad`.
+    /// Perturbs the psi backbone torsion; CB and side-chain are unaffected.
+    pub fn perturb_psi(&mut self, r: usize, delta_rad: f32) {
+        let range = self.atom_range(r);
+        if range.len() < 4 { return; }
+        let ca_idx = range.start + 1;
+        let c_idx  = range.start + 2;
+        let o_idx  = range.start + 3;
+        let ca = self.atom_xyz(ca_idx);
+        let c  = self.atom_xyz(c_idx);
+        let axis = norm3(sub3(c, ca));
+        let p = self.atom_xyz(o_idx);
+        let rp = rodrigues(p, c, axis, delta_rad);
+        self.atoms.x[o_idx] = rp[0];
+        self.atoms.y[o_idx] = rp[1];
+        self.atoms.z[o_idx] = rp[2];
+    }
+
+    #[inline(always)]
+    fn atom_xyz(&self, i: usize) -> [f32; 3] {
+        [self.atoms.x[i], self.atoms.y[i], self.atoms.z[i]]
+    }
+}
+
+// ── Rodrigues rotation ────────────────────────────────────────────────────────
+
+/// Rotate `point` around `axis` (unit vector) through `origin` by `angle` radians.
+/// Uses Rodrigues' rotation formula.
+pub fn rodrigues(point: [f32; 3], origin: [f32; 3], axis: [f32; 3], angle: f32) -> [f32; 3] {
+    let v    = sub3(point, origin);
+    let ca   = angle.cos();
+    let sa   = angle.sin();
+    let dot  = v[0]*axis[0] + v[1]*axis[1] + v[2]*axis[2];
+    let cx   = cross3(axis, v);
+    let rotd = [
+        v[0]*ca + cx[0]*sa + axis[0]*dot*(1.0 - ca),
+        v[1]*ca + cx[1]*sa + axis[1]*dot*(1.0 - ca),
+        v[2]*ca + cx[2]*sa + axis[2]*dot*(1.0 - ca),
+    ];
+    add3(rotd, origin)
+}
+
+#[inline(always)] fn sub3(a:[f32;3], b:[f32;3]) -> [f32;3] { [a[0]-b[0],a[1]-b[1],a[2]-b[2]] }
+#[inline(always)] fn add3(a:[f32;3], b:[f32;3]) -> [f32;3] { [a[0]+b[0],a[1]+b[1],a[2]+b[2]] }
+#[inline(always)] fn cross3(a:[f32;3], b:[f32;3]) -> [f32;3] {
+    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+}
+#[inline(always)] fn norm3(v:[f32;3]) -> [f32;3] {
+    let l = (v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt().max(1e-8);
+    [v[0]/l, v[1]/l, v[2]/l]
 }
 
 // ── Backbone geometry helpers ─────────────────────────────────────────────────

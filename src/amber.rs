@@ -367,7 +367,44 @@ pub fn topology(aa: AminoAcid) -> &'static ResTopology {
 /// Lorentz-Berthelot mixing for AMBER r_min_half (additive) and epsilon (geometric).
 #[inline(always)]
 pub fn mix_lj(a: &AmberNbParams, b: &AmberNbParams) -> (f32, f32) {
-    let r_ij = a.r_min_half + b.r_min_half;  // R_min_ij
+    let r_ij = a.r_min_half + b.r_min_half;
     let eps_ij = (a.epsilon * b.epsilon).sqrt();
     (r_ij, eps_ij)
 }
+
+// ── EEF1 implicit solvation parameters ───────────────────────────────────────
+
+/// EEF1 parameters for one atom type (Lazaridis & Karplus, 1999, Proteins 35:133).
+///
+/// `dg_ref`  — reference free energy of solvation (kcal/mol).
+///             Positive = hydrophobic (prefers burial).
+///             Negative = polar/charged (prefers exposure to water).
+/// `vol`     — atomic volume (Å³) used as the exclusion volume in burial integrals.
+/// `lambda`  — Gaussian correlation length (Å); controls burial decay distance.
+#[derive(Clone, Copy)]
+pub struct Eef1Params {
+    pub dg_ref: f32,
+    pub vol:    f32,
+    pub lambda: f32,
+}
+
+/// EEF1 table indexed by `AtomType as usize`.
+/// Values from Lazaridis & Karplus 1999, Table 1 (kcal/mol, Å³, Å).
+pub static EEF1: [Eef1Params; N_ATOM_TYPES] = [
+    Eef1Params { dg_ref:  0.000, vol: 14.7, lambda: 3.50 }, // C   (sp2)
+    Eef1Params { dg_ref: -0.187, vol: 11.7, lambda: 3.70 }, // CA  (aromatic/aliphatic C)
+    Eef1Params { dg_ref: -0.187, vol: 11.7, lambda: 3.70 }, // CB
+    Eef1Params { dg_ref: -0.187, vol: 11.7, lambda: 3.70 }, // CC
+    Eef1Params { dg_ref: -0.187, vol: 11.7, lambda: 3.70 }, // CT  (sp3 aliphatic)
+    Eef1Params { dg_ref: -6.700, vol:  0.0, lambda: 3.50 }, // N   (backbone amide)
+    Eef1Params { dg_ref:-10.000, vol: 15.0, lambda: 3.50 }, // N2  (Arg guanidinium)
+    Eef1Params { dg_ref:-20.000, vol: 15.0, lambda: 3.50 }, // N3  (Lys NZ, charged)
+    Eef1Params { dg_ref: -6.700, vol: 15.0, lambda: 3.50 }, // NA  (aromatic N-H)
+    Eef1Params { dg_ref: -6.700, vol: 15.0, lambda: 3.50 }, // NB
+    Eef1Params { dg_ref: -5.330, vol: 14.2, lambda: 3.15 }, // O   (carbonyl)
+    Eef1Params { dg_ref:-10.000, vol: 14.2, lambda: 3.15 }, // O2  (carboxylate, charged)
+    Eef1Params { dg_ref: -5.920, vol: 12.5, lambda: 3.15 }, // OH
+    Eef1Params { dg_ref: -5.920, vol: 12.5, lambda: 3.15 }, // OS
+    Eef1Params { dg_ref: -3.240, vol: 32.9, lambda: 3.90 }, // S
+    Eef1Params { dg_ref: -3.240, vol: 32.9, lambda: 3.90 }, // SH
+];
