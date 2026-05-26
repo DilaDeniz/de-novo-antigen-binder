@@ -1,128 +1,170 @@
 # De Novo Antigen Binder
 
-A generative de novo antibody design engine written in pure Rust — no PyTorch, no TensorFlow, no ONNX, no bioinformatics library dependencies.  Given a target antigen (PDB file or FASTA peptide) it outputs the 3-D coordinates and amino acid sequence of an antibody candidate optimised to bind it.
+A generative de novo antibody design engine in pure Rust.
+No PyTorch. No TensorFlow. No ONNX. No bioinformatics library dependencies.
 
-Two operating modes:
+Given a target antigen (PDB file or FASTA string), it searches for an antibody
+candidate sequence and 3-D structure that binds it, driven entirely by a
+physics-based energy function and a reverse-diffusion + Monte Carlo algorithm.
 
-| Mode | Representation | Force field | Population | Typical time |
-|------|---------------|-------------|-----------|-------------|
-| Coarse-grained (default) | 1 point/residue (Cα) | Residue-level LJ + Coulomb | 64 candidates | ~35 ms |
-| All-atom (`--allatom`) | All heavy atoms (AMBER) | AMBER99SB-ildn LJ + Coulomb | 64 CPU / 1024 GPU | ~60 ms CPU |
+---
+
+## Features
+
+- **Two representation levels** — fast Cα coarse-grained mode for rapid
+  exploration, and a full all-atom AMBER99SB-ildn mode for production-quality
+  results.
+- **In-house AMBER99SB force field** — partial charges and LJ parameters for
+  all 20 amino acids, hard-coded as `const` tables; no file I/O, no parser.
+- **Dunbrack rotamer library** — top-5 backbone-independent rotamers per amino
+  acid, Metropolis MC acceptance, NERF side-chain reconstruction.
+- **Optional GPU acceleration** — WGSL compute shader evaluates AMBER
+  LJ + Coulomb for 1 024 candidates simultaneously via wgpu.
+- **Lock-free parallelism** — Rayon parallel iterator over independent
+  candidates; zero `Mutex`, zero `Arc`, zero atomics.
+- **SIMD-friendly layout** — Structure-of-Arrays (coordinates in separate
+  `Vec<f32>`) lets LLVM auto-vectorise inner force loops.
+- **O(n) spatial lookup** — `SpatialHashGrid` built once on the antigen, shared
+  read-only across all Rayon threads; 27-cell 3×3×3 neighbour probe.
+
+---
+
+## Quick Start
+
+```bash
+# Requires Rust 1.75+
+git clone https://github.com/DilaDeniz/de-novo-antigen-binder
+cd de-novo-antigen-binder
+cargo build --release
+```
+
+```bash
+# Design a 12-residue antibody from a peptide antigen (Cα mode, ~35 ms)
+./target/release/binder --seq MKTAYIAKQRQISFVK --length 12
+
+# Full all-atom AMBER engine (CPU)
+./target/release/binder --seq MKTAYIAKQRQISFVK --length 12 --allatom
+
+# All-atom with GPU acceleration
+./target/release/binder --pdb antigen.pdb --length 20 --allatom --gpu --out antibody.pdb
+```
+
+---
 
 ## How It Works
 
-### Coarse-grained path
+### 1 — Physics-based scoring
 
-1. **Physics-based scoring** — interaction energy from Lennard-Jones (Van der Waals), Coulomb electrostatics, and a hydrophobic bonus term.
-2. **Reverse diffusion** — the antibody starts as random noise.  Each step the energy gradient pulls residues toward the antigen surface.
-3. **Monte Carlo sequence optimisation** — each residue has a chance to mutate; mutations are accepted or rejected via the Metropolis criterion under a simulated-annealing temperature schedule.
-4. **Rayon parallelism** — 64 independent candidates run on all CPU cores with zero shared mutable state.
-
-### All-atom path (`--allatom`)
-
-Everything above, plus:
-
-1. **AMBER99SB-ildn force field** — all heavy atoms with per-atom partial charges and LJ parameters (ε, Rmin/2) from the AMBER99SB parameter set.  Written entirely in-house with no external force-field library.
-2. **NERF side-chain reconstruction** — the Natural Extension Reference Frame algorithm places every side-chain atom from backbone + chi angles in O(atoms) time.
-3. **Rotamer MC moves** — Metropolis proposals draw from the Dunbrack backbone-independent rotamer library (top-5 rotamers per amino acid, all 20 AAs).  Accepted/rejected by full all-atom ΔE.
-4. **Optional GPU compute** (`--gpu`) — WGSL compute shader evaluates AMBER LJ + Coulomb over 1024 candidates simultaneously.  Each workgroup handles one candidate; threads stride over antigen atoms; parallel reduction returns energy per candidate.
-
-## Energy Function
-
-### Coarse-grained
+The binding energy between antibody and antigen atoms is:
 
 ```
-E = SUM over all (antigen_i, antibody_j) pairs:
-      4*eps_ij * [(sigma_ij/r)^12 - (sigma_ij/r)^6]   (LJ)
-    + 332 * q_i * q_j / r                               (Coulomb, AMBER units)
-    - 0.5  [if both hydrophobic and r < 6 A]            (hydrophobic bonus)
+E = Σ  ε_ij [(R_ij/r)¹² − 2(R_ij/r)⁶]          ← AMBER LJ (all-atom)
+     + 332 · q_i · q_j / r                        ← Coulomb (kcal/mol, AMBER units)
+     − 0.5  [hydrophobic pair, r < 6 Å]           ← hydrophobic bonus
 ```
 
-### All-atom (AMBER)
+The coarse-grained mode uses `4ε[(σ/r)¹² − (σ/r)⁶]` with residue-level
+parameters; the all-atom mode uses the AMBER convention with per-atom
+`r_min_half` and partial charges from AMBER99SB-ildn.
+
+### 2 — Reverse diffusion
+
+The antibody is initialised as random noise on a sphere around the antigen
+centre of mass.  Each step:
+
+1. Compute force `F = −∇E` via the spatial hash grid (all-atom or Cα).
+2. Gradient step: `x += η·F` (clamped to ≤ 2 Å to prevent LJ explosion).
+3. Langevin noise: `x += σ_T · ξ` where `σ_T = NOISE_BASE · √T`.
+4. Harmonic restraint keeps residues within 20 Å of the antigen surface.
+
+### 3 — Metropolis Monte Carlo
+
+At each step every residue has a chance to:
+
+- **Mutate** to a different amino acid — ΔE evaluated at Cα level; accepted
+  with probability `min(1, exp(−ΔE/T))`.
+- **Rotamer move** (all-atom mode) — a new chi-angle combination is drawn from
+  the Dunbrack library; the side chain is rebuilt via NERF; accepted by full
+  Metropolis criterion.
+
+Temperature follows an exponential annealing schedule: T(t) = 3·(0.02/3)^(t/N).
+
+### 4 — Parallel population
+
+64 (CPU) or 1 024 (GPU) independent candidates run in parallel.  Each owns its
+own `ResidueCloud`/`AtomProtein` and `SmallRng`; there is no shared mutable
+state.  The champion (lowest interaction energy) is returned.
+
+### GPU hybrid loop (optional)
+
+When `--gpu` is passed:
+
+1. **GPU phase** — 1 024 candidates × 200 gradient-only steps; every 10 steps
+   the WGSL shader scores all candidates and the top-64 survive.
+2. **CPU refinement** — 64 survivors × 600 Langevin + rotamer MC steps on Rayon.
+
+---
+
+## NERF Algorithm
+
+Side-chain atoms are placed with the Natural Extension Reference Frame (NERF)
+algorithm (Parsons et al., 2005).  Given reference atoms A-B-C and internal
+coordinates (bond length, bond angle, dihedral), atom D is placed as:
 
 ```
-E = SUM over all (antigen_i, antibody_j) atom pairs:
-      eps_ij * [(R_ij/r)^12 - 2*(R_ij/r)^6]   (AMBER LJ, R_ij = rmin_i + rmin_j)
-    + 332 * q_i * q_j / r                       (Coulomb)
-    - 0.5  [hydrophobic pairs within 6 A]
+bc = normalise(C − B)
+n  = normalise((B − A) × bc)
+m  = bc × n
+D  = C + L · [−cos(θ)·bc + sin(θ)·cos(φ)·m + sin(θ)·sin(φ)·n]
 ```
 
-Lorentz-Berthelot mixing: `eps_ij = sqrt(eps_i * eps_j)`, `R_ij = r_min_half_i + r_min_half_j`.
+One function, ~20 lines, no matrix library.
 
-10 Å cutoff.  All r² comparisons avoid unnecessary sqrt calls.
+---
 
 ## Architecture
 
 ```
 src/
-  amber.rs      AMBER99SB atom types, LJ parameters, partial charges, residue topologies
-  rotamer.rs    Dunbrack rotamer library + NERF atom placement algorithm
-  allatom.rs    AtomCloud (flat SoA, all heavy atoms) + AtomProtein (residue bookkeeping)
-  atom.rs       AminoAcid enum + ResidueCloud (Cα-only SoA, coarse-grained path)
-  energy.rs     LJ + Coulomb + hydrophobic for both Cα and all-atom representations
-  spatial.rs    Lock-free SpatialHashGrid — O(n) neighbour lookup, shared across Rayon threads
-  diffusion.rs  Population-based reverse diffusion + MC (both CG and all-atom loops)
-  pdb.rs        PDB reader / FASTA peptide builder / PDB writer (Cα and all-atom)
-  gpu.rs        wgpu GPU context + compute pipeline (feature = "gpu")
-  error.rs      BinderError — no panics, full Result propagation
-  main.rs       CLI entry point
+  amber.rs      AMBER99SB atom types, ε/Rmin per type, per-residue partial
+                charges and heavy-atom topologies (all in-house const tables)
+  rotamer.rs    Dunbrack rotamer library + NERF place_atom + BondDef tables
+  allatom.rs    AtomCloud (flat all-atom SoA) · AtomProtein (residue bookkeeping,
+                chi angles, mutate_residue via Vec::splice)
+  atom.rs       AminoAcid enum · ResidueCloud (Cα-only SoA, coarse-grained path)
+  energy.rs     LJ + Coulomb + hydrophobic — brute-force + grid-accelerated
+                versions for both Cα and all-atom representations
+  spatial.rs    SpatialHashGrid — build O(n), query O(avg_density), Sync
+  diffusion.rs  run (CG) · run_allatom (hybrid GPU/CPU) — both lock-free Rayon
+  pdb.rs        PDB reader (CA-only) · FASTA builder · PDB writers (Cα + all-atom)
+  gpu.rs        wgpu GpuContext + score_batch (feature = "gpu")
+  error.rs      BinderError — Io / Parse / EmptyInput, no panics
+  main.rs       CLI: --pdb, --seq, --length, --out, --allatom, --gpu, --no-gpu
 shaders/
-  energy.wgsl   WGSL compute shader: AMBER LJ + Coulomb reduction
+  energy.wgsl   WGSL compute shader — AMBER LJ + Coulomb, stride loop,
+                shared-memory parallel reduction
 ```
 
-### Key design decisions
+---
 
-- **Structure-of-Arrays layout** — `x`, `y`, `z`, `charge`, `epsilon`, `r_min_half` live in separate `Vec<f32>`.  Inner force loops read contiguous slices, enabling LLVM auto-vectorisation with SIMD loads.
-- **SpatialHashGrid** — the antigen is hashed into 10 Å cells once.  Each force query inspects at most 27 neighbouring cells.  The grid is immutable after construction so all Rayon threads share it with zero synchronisation.
-- **Lock-free parallelism** — each of the 64+ candidates owns its own data and `SmallRng`.  Rayon `into_par_iter().map(...).reduce_with(...)` produces the best candidate with no `Mutex`, no `Arc`, no atomics.
-- **NERF algorithm** — side-chain atoms are placed by the Natural Extension Reference Frame algorithm from internal coordinates (bond length, bond angle, dihedral).  One function, ~20 lines, no matrix libraries.
-- **In-house force field** — AMBER99SB parameters are hard-coded `const` tables in `amber.rs`.  No file I/O, no parser, no external library.
-- **GPU-optional design** — `gpu.rs` is compiled only with `--features gpu` (default).  `GpuContext::try_init()` returns `Option<Self>`; the diffusion engine falls back to CPU Rayon when it is `None`.
+## CLI Reference
 
-## Installation
+```
+USAGE
+  binder --pdb <antigen.pdb> [OPTIONS]
+  binder --seq <PEPTIDE>    [OPTIONS]
 
-Requires Rust 1.75+ (stable).
-
-```bash
-git clone https://github.com/DilaDeniz/de-novo-antigen-binder
-cd de-novo-antigen-binder
-cargo build --release          # CPU-only (no wgpu compiled in)
-cargo build --release          # GPU + CPU (default, compiles wgpu)
+OPTIONS
+  --pdb   PATH     Antigen input as PDB file (CA atoms used as Cα trace)
+  --seq   STRING   Antigen as one-letter FASTA string
+  --length N       Desired antibody length in residues [default: same as antigen]
+  --out   PATH     Write output PDB to file [default: stdout]
+  --allatom        Use full AMBER99SB all-atom engine
+  --gpu            GPU acceleration — implies --allatom
+  --no-gpu         Force CPU-only (overrides --gpu)
 ```
 
-The binary lands at `target/release/binder`.
-
-## Usage
-
-```bash
-# Coarse-grained (fast, Cα-only)
-binder --seq ACDEFGHIKLMNPQRSTVWY --length 20 --out antibody.pdb
-
-# All-atom AMBER engine, CPU only
-binder --seq MKTAYIAKQRQISFVK --length 20 --allatom --out antibody.pdb
-
-# All-atom with GPU acceleration (requires GPU hardware)
-binder --pdb antigen.pdb --length 20 --allatom --gpu --out antibody.pdb
-
-# Design against a PDB antigen
-binder --pdb antigen.pdb --length 20 --out antibody.pdb
-```
-
-### Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--pdb PATH` | — | Antigen PDB file |
-| `--seq STRING` | — | Antigen as one-letter FASTA string |
-| `--length N` | same as antigen | Antibody length in residues |
-| `--out PATH` | stdout | Output PDB file |
-| `--allatom` | off | Use full AMBER99SB all-atom engine |
-| `--gpu` | off | Enable GPU acceleration (implies `--allatom`) |
-| `--no-gpu` | — | Force CPU-only even if GPU available |
-
-One of `--pdb` or `--seq` is required.
-
-### Example output (coarse-grained)
+### Example output (Cα mode)
 
 ```
 === De Novo Antibody Design Result ===
@@ -131,9 +173,11 @@ Antibody sequence : RTHHRHAKVRGGQANN
 Binding energy    : -518.50 kcal/mol
 Residues          : 16
 Elapsed           : 35ms
+
+ATOM      1  CA  ARG B   1     ...
 ```
 
-### Example output (all-atom)
+### Example output (all-atom mode)
 
 ```
 === De Novo Antibody Design Result (All-Atom AMBER) ===
@@ -143,19 +187,27 @@ Binding energy    : -42.31 kcal/mol
 Residues          : 16
 Atoms             : 136
 Elapsed           : 120ms
+
+ATOM      1  N   TYR B   1     ...
+ATOM      2  CA  TYR B   1     ...
 ```
 
-The all-atom binding energy is on a different scale from the Cα-only one (AMBER LJ minimum is at Rmin, not sigma).
+> The all-atom energy is on a different numerical scale from the Cα mode
+> because the AMBER LJ minimum is at `R_min` rather than `σ`.
+
+---
 
 ## Performance
 
-| Mode | Antigen res | Antibody res | Candidates | Steps | Wall time |
-|------|------------|--------------|-----------|-------|-----------|
-| Coarse-grained | 8 | 8 | 64 | 800 | ~35 ms |
-| Coarse-grained | 65 | 20 | 64 | 800 | ~96 ms |
-| All-atom CPU | 8 | 8 | 64 | 600 | ~60 ms |
+| Mode | Antigen | Antibody | Candidates | Steps | Time (4 cores) |
+|------|---------|----------|-----------|-------|---------------|
+| Cα coarse-grained | 8 res | 8 res | 64 | 800 | ~35 ms |
+| Cα coarse-grained | 65 res | 20 res | 64 | 800 | ~96 ms |
+| All-atom CPU | 8 res | 8 res | 64 | 600 | ~60 ms |
 
-Tested on 4 cores, release build (`opt-level=3`, `lto="fat"`).
+Release build: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`.
+
+---
 
 ## Running Tests
 
@@ -163,7 +215,33 @@ Tested on 4 cores, release build (`opt-level=3`, `lto="fat"`).
 cargo test
 ```
 
-Eight unit tests: LJ repulsion, Coulomb attraction, spatial hash lookup, brute-force/grid force agreement, NERF bond length, rotamer library contents, and all-atom residue construction for ALA and GLY.
+8 unit tests:
+
+| Test | What it checks |
+|------|---------------|
+| `lj_repulsion_at_close_range` | Two Gly at 1 Å → positive LJ force |
+| `opposite_charges_attract` | Lys (+1) and Asp (−1) at 3 Å → negative Coulomb force |
+| `grid_forces_match_brute_force` | Grid and O(n²) forces agree to 1e-4 |
+| `query_finds_nearby_atom` | SpatialHashGrid finds atom 0, not atom 1 |
+| `nerf_places_atom_at_correct_bond_length` | NERF output has correct bond length |
+| `rotamer_lib_non_empty_for_ile` | Ile rotamer library has 5 entries |
+| `build_ala_residue` | ALA has exactly 5 heavy atoms |
+| `build_gly_residue` | GLY has exactly 4 heavy atoms (no Cβ) |
+
+---
+
+## Limitations
+
+- Residue-level coarse-grained mode uses one Cα point per residue — it is a
+  fast structural sketch, not all-atom accuracy.
+- All-atom mode uses ideal backbone geometry (no backbone torsion sampling);
+  backbone flexibility requires additional MD relaxation.
+- No explicit solvent or GBSA solvation — complement with MM-GBSA or explicit
+  MD for binding free energy estimates.
+- For real drug discovery workflows, validate experimentally and with all-atom
+  MD relaxation (e.g., OpenMM, GROMACS).
+
+---
 
 ## License
 
