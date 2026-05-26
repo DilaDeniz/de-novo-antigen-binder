@@ -1,0 +1,30 @@
+[package]
+name = "de-novo-antigen-binder"
+version = "0.1.0"
+edition = "2021"
+description = "Physics-based generative de novo antibody design engine — pure Rust, no ML deps"
+license = "Apache-2.0"
+
+[[bin]]
+name = "binder"
+path = "src/main.rs"
+
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+rayon = "1.10"
+rand = { version = "0.8", features = ["small_rng"] }
+wgpu     = { version = "0.20", optional = true, default-features = false, features = ["wgsl", "vulkan-portability", "metal", "dx12"] }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1.14", optional = true, features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
