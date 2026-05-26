@@ -56,7 +56,7 @@ pub struct DiffusionResult {
     pub sequence: String,
 }
 
-pub struct AllaAtomResult {
+pub struct AllAtomResult {
     pub antibody: AtomProtein,
     pub energy:   f32,
     pub sequence: String,
@@ -234,10 +234,13 @@ fn allatom_energy(ag: &AtomProtein, ab: &AtomProtein) -> f32 {
 }
 
 /// Gradient + noise step on the Cα positions only, then rebuild side-chains.
+///
+/// `ag_ca` and `ag_ca_grid` are the antigen Cα cloud and its spatial hash,
+/// pre-computed once by the caller and shared read-only across all steps.
 fn allatom_diffusion_step(
     ab: &mut AtomProtein,
-    ag: &AtomProtein,
-    grid: &SpatialHashGrid,
+    ag_ca: &ResidueCloud,
+    ag_ca_grid: &SpatialHashGrid,
     ag_center: [f32; 3],
     temp: f32,
     rng: &mut SmallRng,
@@ -245,29 +248,18 @@ fn allatom_diffusion_step(
 ) {
     let n = ab.n_residues();
 
-    // Compute forces at Cα positions using the flat AtomCloud of the antigen
-    // (grid is built on ag.atoms.x / y / z).
     let mut fx_buf = vec![0.0_f32; n];
     let mut fy_buf = vec![0.0_f32; n];
     let mut fz_buf = vec![0.0_f32; n];
 
-    // Build a temporary Cα-only cloud for force computation
+    // Build antibody Cα cloud for force computation (residue-level approximation)
     let mut ca_cloud = ResidueCloud::with_capacity(n);
     for r in 0..n {
         let p = ab.ca_pos(r);
         ca_cloud.push(p[0], p[1], p[2], ab.amino_acid[r]);
     }
 
-    // Re-use antigen Cα cloud for force direction (residue-level approximation)
-    let mut ag_ca = ResidueCloud::with_capacity(ag.n_residues());
-    for r in 0..ag.n_residues() {
-        let p = ag.ca_pos(r);
-        ag_ca.push(p[0], p[1], p[2], ag.amino_acid[r]);
-    }
-
-    let mut ag_grid = SpatialHashGrid::new(10.0);
-    ag_grid.build(&ag_ca.x, &ag_ca.y, &ag_ca.z);
-    energy::compute_forces_with_grid(&ag_ca, &ag_grid, &ca_cloud, &mut fx_buf, &mut fy_buf, &mut fz_buf);
+    energy::compute_forces_with_grid(ag_ca, ag_ca_grid, &ca_cloud, &mut fx_buf, &mut fy_buf, &mut fz_buf);
 
     let noise_sigma = if with_noise { NOISE_BASE * temp.sqrt() } else { 0.0 };
 
@@ -309,9 +301,9 @@ fn allatom_diffusion_step(
                     let rot_idx = rng.gen_range(0..rots.len());
                     let new_rot = rots[rot_idx];
 
-                    let old_e = residue_contribution_allatom(r, ab, &ag_ca);
+                    let old_e = residue_contribution_allatom(r, ab, ag_ca);
                     ab.apply_rotamer(r, &new_rot);
-                    let new_e = residue_contribution_allatom(r, ab, &ag_ca);
+                    let new_e = residue_contribution_allatom(r, ab, ag_ca);
                     let delta_e = new_e - old_e;
                     let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                     if !accept {
@@ -325,12 +317,12 @@ fn allatom_diffusion_step(
                 let new_aa  = AminoAcid::from_index(rng.gen_range(0..AA_COUNT));
                 let old_chi = ab.chi[r];
 
-                let old_e = residue_contribution_allatom(r, ab, &ag_ca);
+                let old_e = residue_contribution_allatom(r, ab, ag_ca);
                 // Use first rotamer of new AA as proposal
                 let rots = rotamers(new_aa);
                 let new_chi = if rots.is_empty() { [0.0f32; 4] } else { rots[0].chi };
                 ab.mutate_residue(r, new_aa, new_chi);
-                let new_e = residue_contribution_allatom(r, ab, &ag_ca);
+                let new_e = residue_contribution_allatom(r, ab, ag_ca);
                 let delta_e = new_e - old_e;
                 let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                 if !accept {
@@ -382,19 +374,21 @@ pub fn run_allatom(
     antigen: &AtomProtein,
     ab_length: usize,
     #[cfg(feature = "gpu")] gpu: Option<&crate::gpu::GpuContext>,
-) -> AllaAtomResult {
+) -> AllAtomResult {
     let center = antigen.ca_center_of_mass();
 
-    // Build spatial hash on antigen Cα atoms for residue-level force direction
-    let mut ag_grid = SpatialHashGrid::new(10.0);
-    ag_grid.build(&antigen.atoms.x, &antigen.atoms.y, &antigen.atoms.z);
-
-    #[cfg(feature = "gpu")]
-    let use_gpu = gpu.is_some();
-    #[cfg(not(feature = "gpu"))]
-    let use_gpu = false;
-
-    let population_size = if use_gpu { AA_POPULATION } else { TOP_K };
+    // Pre-compute antigen Cα cloud and grid once; shared read-only across all steps.
+    let ag_ca = {
+        let n = antigen.n_residues();
+        let mut cloud = ResidueCloud::with_capacity(n);
+        for r in 0..n {
+            let p = antigen.ca_pos(r);
+            cloud.push(p[0], p[1], p[2], antigen.amino_acid[r]);
+        }
+        cloud
+    };
+    let mut ag_ca_grid = SpatialHashGrid::new(10.0);
+    ag_ca_grid.build(&ag_ca.x, &ag_ca.y, &ag_ca.z);
 
     // ── GPU broad-sampling phase ──────────────────────────────────────────────
     #[cfg(feature = "gpu")]
@@ -413,7 +407,7 @@ pub fn run_allatom(
             // Move each candidate with gradient (no noise, no MC) in parallel
             all_cands.par_iter_mut().enumerate().for_each(|(seed, ab)| {
                 let mut rng = SmallRng::seed_from_u64(seed_u64(seed + iter * AA_POPULATION));
-                allatom_diffusion_step(ab, antigen, &ag_grid, center, temp, &mut rng, false);
+                allatom_diffusion_step(ab, &ag_ca, &ag_ca_grid, center, temp, &mut rng, false);
             });
 
             // Every 10 steps GPU-score all candidates and prune to TOP_K
@@ -480,7 +474,7 @@ pub fn run_allatom(
             let mut rng = SmallRng::seed_from_u64(seed_u64(seed + 999_999));
             for iter in 0..CPU_STEPS {
                 let temp = temperature(iter, CPU_STEPS);
-                allatom_diffusion_step(&mut ab, antigen, &ag_grid, center, temp, &mut rng, true);
+                allatom_diffusion_step(&mut ab, &ag_ca, &ag_ca_grid, center, temp, &mut rng, true);
             }
             let e = allatom_energy(antigen, &ab);
             (ab, e)
@@ -490,5 +484,5 @@ pub fn run_allatom(
 
     let (antibody, energy) = best;
     let sequence = antibody.sequence();
-    AllaAtomResult { antibody, energy, sequence }
+    AllAtomResult { antibody, energy, sequence }
 }
