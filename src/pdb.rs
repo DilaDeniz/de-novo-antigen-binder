@@ -8,6 +8,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead};
 
+use crate::allatom::AtomProtein;
+use crate::amber::topology;
 use crate::atom::{AminoAcid, ResidueCloud};
 use crate::error::BinderError;
 
@@ -133,6 +135,40 @@ pub fn write_pdb(cloud: &ResidueCloud, chain_id: char) -> String {
             cloud.y[i],
             cloud.z[i],
         );
+    }
+    let _ = write!(out, "END\n");
+    out
+}
+
+/// Serialise an `AtomProtein` to PDB ATOM records (all heavy atoms).
+pub fn write_pdb_allatom(prot: &AtomProtein, chain_id: char) -> String {
+    let n_atoms = prot.n_atoms();
+    let mut out = String::with_capacity(n_atoms * 80);
+    let mut serial = 0usize;
+
+    for r in 0..prot.n_residues() {
+        let aa      = prot.amino_acid[r];
+        let topo    = topology(aa);
+        let range   = prot.atom_range(r);
+        let res_seq = (r + 1).min(9_999);
+
+        for (k, atom_idx) in range.enumerate() {
+            if k >= topo.atoms.len() { break; }
+            serial += 1;
+            let atom_name = topo.atoms[k].name;
+            let _ = write!(
+                out,
+                "ATOM  {:5} {:<4} {:3} {:1}{:4}    {:8.3}{:8.3}{:8.3}  1.00  0.00           C\n",
+                serial.min(99_999),
+                atom_name,
+                aa.three_letter(),
+                chain_id,
+                res_seq,
+                prot.atoms.x[atom_idx],
+                prot.atoms.y[atom_idx],
+                prot.atoms.z[atom_idx],
+            );
+        }
     }
     let _ = write!(out, "END\n");
     out

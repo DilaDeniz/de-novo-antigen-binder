@@ -3,6 +3,7 @@
 /// All distances passed in as r² to avoid sqrt wherever the cutoff check
 /// or full formula permits (LJ, hydrophobic).  Coulomb requires 1/r so sqrt
 /// is computed once per pair and reused.
+use crate::allatom::AtomCloud;
 use crate::atom::ResidueCloud;
 use crate::spatial::SpatialHashGrid;
 
@@ -188,6 +189,53 @@ pub fn compute_forces(
         fy[j] = acc_fy;
         fz[j] = acc_fz;
     }
+}
+
+/// Total AMBER LJ + Coulomb + hydrophobic energy for all-atom clouds.
+///
+/// Uses the AMBER convention V = ε[(R_ij/r)^12 − 2(R_ij/r)^6] where
+/// R_ij = r_min_half_i + r_min_half_j.
+pub fn interaction_energy_atoms(antigen: &AtomCloud, antibody: &AtomCloud) -> f32 {
+    let ag_n = antigen.len();
+    let ab_n = antibody.len();
+    let mut total = 0.0_f32;
+
+    for j in 0..ab_n {
+        let bx  = antibody.x[j];
+        let by  = antibody.y[j];
+        let bz  = antibody.z[j];
+        let bq  = antibody.charge[j];
+        let brm = antibody.r_min_half[j];
+        let be  = antibody.epsilon[j];
+        let bh  = antibody.hydrophobic[j];
+
+        for i in 0..ag_n {
+            let dx   = bx - antigen.x[i];
+            let dy   = by - antigen.y[i];
+            let dz   = bz - antigen.z[i];
+            let r_sq = dx * dx + dy * dy + dz * dz;
+
+            if r_sq > CUTOFF_SQ || r_sq < MIN_R_SQ { continue; }
+
+            let r_ij = brm + antigen.r_min_half[i];
+            let eps  = (be * antigen.epsilon[i]).sqrt();
+            let r2   = (r_ij * r_ij) / r_sq;
+            let r6   = r2 * r2 * r2;
+            let r12  = r6 * r6;
+            total += eps * (r12 - 2.0 * r6);
+
+            let q1 = bq;
+            let q2 = antigen.charge[i];
+            if q1 != 0.0 && q2 != 0.0 {
+                total += COULOMB_K * q1 * q2 / r_sq.sqrt();
+            }
+
+            if bh == 1 && antigen.hydrophobic[i] == 1 && r_sq < HYDRO_CUTOFF_SQ {
+                total += HYDRO_BONUS;
+            }
+        }
+    }
+    total
 }
 
 /// Grid-accelerated force computation using the antigen's SpatialHashGrid.
