@@ -239,10 +239,12 @@ fn allatom_energy(ag: &AtomProtein, ab: &AtomProtein) -> f32 {
 
 /// Gradient + noise step on the Cα positions only, then rebuild side-chains.
 ///
-/// `ag_ca` and `ag_ca_grid` are the antigen Cα cloud and its spatial hash,
-/// pre-computed once by the caller and shared read-only across all steps.
+/// `ag_ca` / `ag_ca_grid` — antigen Cα cloud + hash, pre-computed once, used
+///   for the fast force computation.
+/// `ag` — full antigen AtomProtein, used for AMBER-consistent MC energy evals.
 fn allatom_diffusion_step(
     ab: &mut AtomProtein,
+    ag: &AtomProtein,
     ag_ca: &ResidueCloud,
     ag_ca_grid: &SpatialHashGrid,
     ag_center: [f32; 3],
@@ -305,9 +307,9 @@ fn allatom_diffusion_step(
                     let rot_idx = rng.gen_range(0..rots.len());
                     let new_rot = rots[rot_idx];
 
-                    let old_e = residue_contribution_allatom(r, ab, ag_ca);
+                    let old_e = residue_contribution_allatom(r, ab, ag);
                     ab.apply_rotamer(r, &new_rot);
-                    let new_e = residue_contribution_allatom(r, ab, ag_ca);
+                    let new_e = residue_contribution_allatom(r, ab, ag);
                     let delta_e = new_e - old_e;
                     let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                     if !accept {
@@ -321,12 +323,12 @@ fn allatom_diffusion_step(
                 let new_aa  = AminoAcid::from_index(rng.gen_range(0..AA_COUNT));
                 let old_chi = ab.chi[r];
 
-                let old_e = residue_contribution_allatom(r, ab, ag_ca);
+                let old_e = residue_contribution_allatom(r, ab, ag);
                 // Use first rotamer of new AA as proposal
                 let rots = rotamers(new_aa);
                 let new_chi = if rots.is_empty() { [0.0f32; 4] } else { rots[0].chi };
                 ab.mutate_residue(r, new_aa, new_chi);
-                let new_e = residue_contribution_allatom(r, ab, ag_ca);
+                let new_e = residue_contribution_allatom(r, ab, ag);
                 let delta_e = new_e - old_e;
                 let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                 if !accept {
@@ -336,14 +338,15 @@ fn allatom_diffusion_step(
         }
     }
 
-    // Backbone phi/psi torsion MC moves
+    // Backbone phi/psi torsion MC moves — propagating: residues r+1..n also move,
+    // so we evaluate the energy of the entire affected region (r..n).
     for r in 0..n {
         if rng.gen::<f32>() < BACKBONE_MOVE_P {
             let delta = rng.gen_range(-MAX_TORSION_DEG..MAX_TORSION_DEG).to_radians();
             let do_phi = rng.gen::<bool>();
-            let old_e = residue_contribution_allatom(r, ab, &ag_ca);
+            let old_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum();
             if do_phi { ab.perturb_phi(r, delta); } else { ab.perturb_psi(r, delta); }
-            let new_e = residue_contribution_allatom(r, ab, &ag_ca);
+            let new_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum();
             let accept = (new_e - old_e) <= 0.0
                 || rng.gen::<f32>() < (-(new_e - old_e) / temp).exp();
             if !accept {
@@ -353,30 +356,39 @@ fn allatom_diffusion_step(
     }
 }
 
-/// Fast per-residue energy contribution (Cα-level approximation for MC accept/reject).
-fn residue_contribution_allatom(r: usize, ab: &AtomProtein, ag_ca: &ResidueCloud) -> f32 {
-    let p = ab.ca_pos(r);
-    let bq = ab.amino_acid[r].charge();
-    let be = ab.amino_acid[r].lj_epsilon();
-    let bs = ab.amino_acid[r].lj_sigma();
-    let bh = ab.amino_acid[r].is_hydrophobic() as u8;
+/// Fast per-residue energy contribution using AMBER LJ at the Cα level.
+///
+/// Uses real AMBER r_min_half + epsilon from the Cα atoms (atom type CT) of
+/// both the antibody and antigen, matching the convention used for final scoring.
+fn residue_contribution_allatom(r: usize, ab: &AtomProtein, ag: &AtomProtein) -> f32 {
+    let ab_ca = ab.ca_atom_idx[r] as usize;
+    let p     = ab.ca_pos(r);
+    let brm   = ab.atoms.r_min_half[ab_ca];
+    let be    = ab.atoms.epsilon[ab_ca];
+    let bq    = ab.atoms.charge[ab_ca];
+    let bh    = ab.atoms.hydrophobic[ab_ca];
     let mut e = 0.0_f32;
-    for i in 0..ag_ca.len() {
-        let dx = p[0] - ag_ca.x[i];
-        let dy = p[1] - ag_ca.y[i];
-        let dz = p[2] - ag_ca.z[i];
+    for i in 0..ag.n_residues() {
+        let ag_ca = ag.ca_atom_idx[i] as usize;
+        let p_ag  = ag.ca_pos(i);
+        let dx = p[0] - p_ag[0];
+        let dy = p[1] - p_ag[1];
+        let dz = p[2] - p_ag[2];
         let r_sq = dx * dx + dy * dy + dz * dz;
         if r_sq > energy::CUTOFF_SQ || r_sq < 0.25 { continue; }
-        let eps_ij = (be * ag_ca.epsilon[i]).sqrt();
-        let sig_ij = 0.5 * (bs + ag_ca.sigma[i]);
-        let sigma_sq = sig_ij * sig_ij;
-        let s2 = sigma_sq / r_sq;
-        let s6 = s2 * s2 * s2;
-        e += 4.0 * eps_ij * (s6 * s6 - s6);
-        if bq != 0.0 && ag_ca.charge[i] != 0.0 {
-            e += 332.0 * bq * ag_ca.charge[i] / r_sq.sqrt();
+        let arm  = ag.atoms.r_min_half[ag_ca];
+        let ae   = ag.atoms.epsilon[ag_ca];
+        let aq   = ag.atoms.charge[ag_ca];
+        let ah   = ag.atoms.hydrophobic[ag_ca];
+        let r_ij = brm + arm;
+        let eps  = (be * ae).sqrt();
+        let r2   = (r_ij * r_ij) / r_sq;
+        let r6   = r2 * r2 * r2;
+        e += eps * (r6 * r6 - 2.0 * r6);
+        if bq != 0.0 && aq != 0.0 {
+            e += 332.0 * bq * aq / r_sq.sqrt();
         }
-        if bh == 1 && ag_ca.hydrophobic[i] == 1 && r_sq < 36.0 {
+        if bh == 1 && ah == 1 && r_sq < 36.0 {
             e -= 0.5;
         }
     }
@@ -427,11 +439,11 @@ pub fn run_allatom(
             // Move each candidate with gradient (no noise, no MC) in parallel
             all_cands.par_iter_mut().enumerate().for_each(|(seed, ab)| {
                 let mut rng = SmallRng::seed_from_u64(seed_u64(seed + iter * AA_POPULATION));
-                allatom_diffusion_step(ab, &ag_ca, &ag_ca_grid, center, temp, &mut rng, false);
+                allatom_diffusion_step(ab, antigen, &ag_ca, &ag_ca_grid, center, temp, &mut rng, false);
             });
 
-            // Every 10 steps GPU-score all candidates and prune to TOP_K
-            if iter % 10 == 9 {
+            // Score and prune to TOP_K once at the end of the GPU phase
+            if iter == GPU_STEPS - 1 {
                 let n_ab = all_cands[0].n_atoms();
                 let gpu_atoms: Vec<crate::gpu::GpuAtom> = all_cands.iter().flat_map(|ab| {
                     (0..ab.n_atoms()).map(move |k| crate::gpu::GpuAtom {
@@ -494,7 +506,7 @@ pub fn run_allatom(
             let mut rng = SmallRng::seed_from_u64(seed_u64(seed + 999_999));
             for iter in 0..CPU_STEPS {
                 let temp = temperature(iter, CPU_STEPS);
-                allatom_diffusion_step(&mut ab, &ag_ca, &ag_ca_grid, center, temp, &mut rng, true);
+                allatom_diffusion_step(&mut ab, antigen, &ag_ca, &ag_ca_grid, center, temp, &mut rng, true);
             }
             let e = allatom_energy(antigen, &ab);
             (ab, e)
