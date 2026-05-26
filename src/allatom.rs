@@ -345,8 +345,9 @@ impl Default for AtomProtein {
 // ── Backbone torsion perturbation ─────────────────────────────────────────────
 
 impl AtomProtein {
-    /// Rotate all atoms from C onward (C, O, CB, side-chain) around the N→CA
-    /// bond axis by `delta_rad`.  Perturbs the phi backbone torsion.
+    /// Rotate all atoms after the N→CA bond by `delta_rad` and propagate the
+    /// rotation to every subsequent residue.  Correctly models phi torsion: the
+    /// entire chain from C_r onward pivots around the N_r–CA_r axis.
     pub fn perturb_phi(&mut self, r: usize, delta_rad: f32) {
         let range = self.atom_range(r);
         if range.len() < 3 { return; }
@@ -355,17 +356,30 @@ impl AtomProtein {
         let n  = self.atom_xyz(n_idx);
         let ca = self.atom_xyz(ca_idx);
         let axis = norm3(sub3(ca, n));
+        // Rotate atoms after CA within residue r
         for i in (ca_idx + 1)..range.end {
             let p = self.atom_xyz(i);
-            let r = rodrigues(p, ca, axis, delta_rad);
-            self.atoms.x[i] = r[0];
-            self.atoms.y[i] = r[1];
-            self.atoms.z[i] = r[2];
+            let rp = rodrigues(p, ca, axis, delta_rad);
+            self.atoms.x[i] = rp[0];
+            self.atoms.y[i] = rp[1];
+            self.atoms.z[i] = rp[2];
+        }
+        // Propagate: every subsequent residue pivots around the same axis
+        for next_r in (r + 1)..self.n_residues() {
+            let nr = self.atom_range(next_r);
+            for i in nr {
+                let p = self.atom_xyz(i);
+                let rp = rodrigues(p, ca, axis, delta_rad);
+                self.atoms.x[i] = rp[0];
+                self.atoms.y[i] = rp[1];
+                self.atoms.z[i] = rp[2];
+            }
         }
     }
 
-    /// Rotate the carbonyl O around the CA→C bond axis by `delta_rad`.
-    /// Perturbs the psi backbone torsion; CB and side-chain are unaffected.
+    /// Rotate the carbonyl O and all subsequent residues around the CA→C bond
+    /// axis by `delta_rad`.  Correctly models psi torsion: O_r and the entire
+    /// chain from N_{r+1} onward pivot around CA_r–C_r.
     pub fn perturb_psi(&mut self, r: usize, delta_rad: f32) {
         let range = self.atom_range(r);
         if range.len() < 4 { return; }
@@ -375,11 +389,23 @@ impl AtomProtein {
         let ca = self.atom_xyz(ca_idx);
         let c  = self.atom_xyz(c_idx);
         let axis = norm3(sub3(c, ca));
+        // Rotate O of current residue
         let p = self.atom_xyz(o_idx);
         let rp = rodrigues(p, c, axis, delta_rad);
         self.atoms.x[o_idx] = rp[0];
         self.atoms.y[o_idx] = rp[1];
         self.atoms.z[o_idx] = rp[2];
+        // Propagate: every subsequent residue pivots around the same axis
+        for next_r in (r + 1)..self.n_residues() {
+            let nr = self.atom_range(next_r);
+            for i in nr {
+                let p = self.atom_xyz(i);
+                let rp = rodrigues(p, c, axis, delta_rad);
+                self.atoms.x[i] = rp[0];
+                self.atoms.y[i] = rp[1];
+                self.atoms.z[i] = rp[2];
+            }
+        }
     }
 
     #[inline(always)]
