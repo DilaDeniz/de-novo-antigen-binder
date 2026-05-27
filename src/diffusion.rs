@@ -48,6 +48,10 @@ const ROTAMER_MOVE_P: f32 = 0.12;
 const BACKBONE_MOVE_P: f32 = 0.04;
 /// Maximum phi/psi perturbation per MC move (degrees).
 const MAX_TORSION_DEG: f32 = 15.0;
+
+/// Interface-adaptive MC: residues within this distance (Å²) of any antigen Cα
+/// are sampled 3× more aggressively — they are the CDR-equivalent region.
+const IFACE_CUTOFF_SQ: f32 = 64.0; // 8 Å
 const INIT_RADIUS:    f32 = 20.0;
 const MAX_DISP:       f32 = 2.0;
 const RESTRAINT_K:    f32 = 0.02;
@@ -293,12 +297,28 @@ fn allatom_diffusion_step(
         ab.set_ca_pos(r, new_ca);
     }
 
-    // Metropolis AA mutation or rotamer move
+    // Interface mask: residues within 8 Å of any antigen Cα get boosted MC rates.
+    // These are the CDR-equivalent positions — the primary binding determinants.
+    let interface: Vec<bool> = (0..n).map(|r| {
+        let p = ab.ca_pos(r);
+        (0..ag_ca.len()).any(|i| {
+            let dx = p[0] - ag_ca.x[i];
+            let dy = p[1] - ag_ca.y[i];
+            let dz = p[2] - ag_ca.z[i];
+            dx * dx + dy * dy + dz * dz < IFACE_CUTOFF_SQ
+        })
+    }).collect();
+
+    // Metropolis AA mutation or rotamer move — interface-adaptive rates.
     for r in 0..n {
+        // Interface residues: 3× higher mutation rate, 2× higher rotamer rate.
+        // Non-interface (framework): 0.4× mutation rate to preserve structure.
+        let eff_mut_p = if interface[r] { MUTATION_P * 3.0 } else { MUTATION_P * 0.4 };
+        let eff_rot_p = if interface[r] { ROTAMER_MOVE_P * 2.0 } else { ROTAMER_MOVE_P };
         let p = rng.gen::<f32>();
-        if p < MUTATION_P {
+        if p < eff_mut_p {
             let move_type = rng.gen::<f32>();
-            if move_type < ROTAMER_MOVE_P {
+            if move_type < eff_rot_p {
                 // Rotamer MC move
                 let aa = ab.amino_acid[r];
                 let rots = rotamers(aa);
@@ -324,7 +344,6 @@ fn allatom_diffusion_step(
                 let old_chi = ab.chi[r];
 
                 let old_e = residue_contribution_allatom(r, ab, ag);
-                // Use first rotamer of new AA as proposal
                 let rots = rotamers(new_aa);
                 let new_chi = if rots.is_empty() { [0.0f32; 4] } else { rots[0].chi };
                 ab.mutate_residue(r, new_aa, new_chi);

@@ -4,6 +4,7 @@ mod atom;
 mod diffusion;
 mod energy;
 mod error;
+mod filters;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod pdb;
@@ -132,15 +133,34 @@ fn main() -> Result<(), BinderError> {
         };
         let elapsed = t0.elapsed();
 
+        let quality  = filters::SequenceQuality::assess(&result.antibody, &antigen_aa);
+        let iface_lb = filters::SequenceQuality::interface_labels(&result.antibody, &antigen_aa);
+        let dg_corr  = result.energy + quality.entropy_penalty;
+
         eprintln!(
-            "[binder] Done in {:.2?} | best energy = {:.3} kcal/mol (all-atom AMBER)",
-            elapsed, result.energy,
+            "[binder] Done in {:.2?} | E_MM+solv = {:.3}  ΔG_corr = {:.3} kcal/mol",
+            elapsed, result.energy, dg_corr,
         );
 
         println!("=== De Novo Antibody Design Result (All-Atom AMBER) ===");
         println!("Antigen sequence  : {}", antigen_cg.sequence());
         println!("Antibody sequence : {}", result.sequence);
-        println!("Binding energy    : {:.4} kcal/mol", result.energy);
+        println!("CDR/FR map        : {iface_lb}  (I=interface, F=framework)");
+        println!("Interface residues: {}/{}", quality.n_interface, result.antibody.n_residues());
+        println!();
+        println!("E_MM + ΔΔG_solv   : {:.4} kcal/mol", result.energy);
+        println!("−TΔS_bind (est.)  : +{:.2} kcal/mol  (transl/rot + {n_chi} frozen χ)",
+            quality.entropy_penalty,
+            n_chi = ((quality.entropy_penalty - 5.4) / 0.3).round() as usize,
+        );
+        println!("ΔG_bind (corrected): {:.4} kcal/mol", dg_corr);
+        println!();
+        println!("Net charge        : {:+}", quality.net_charge);
+        println!("Aggregation risk  : {}  (max hydrophobic run: {})",
+            if quality.aggregation_risk { "HIGH ⚠" } else { "Low" },
+            quality.max_hydro_run,
+        );
+        println!();
         println!("Residues          : {}", result.antibody.n_residues());
         println!("Atoms             : {}", result.antibody.n_atoms());
         println!("Elapsed           : {:.2?}", elapsed);
