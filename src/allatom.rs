@@ -133,6 +133,50 @@ impl AtomProtein {
         self.amino_acid.iter().map(|a| a.to_char()).collect()
     }
 
+    /// SG (sulfhydryl) atom position for residue `r`, if it is a Cys.
+    pub fn sg_pos(&self, r: usize) -> Option<[f32; 3]> {
+        if self.amino_acid[r] != AminoAcid::Cys {
+            return None;
+        }
+        let topo = topology(AminoAcid::Cys);
+        for (k, idx) in self.atom_range(r).enumerate() {
+            if k < topo.atoms.len() && topo.atoms[k].name.trim() == "SG" {
+                return Some([self.atoms.x[idx], self.atoms.y[idx], self.atoms.z[idx]]);
+            }
+        }
+        None
+    }
+
+    /// Disulfide bond energy: a Gaussian attractive well centred on the ideal
+    /// S–S bond length (2.05 Å) between every pair of Cys SG atoms. Rewards the
+    /// MC search for discovering Cys pairs positioned to form a disulfide bridge.
+    pub fn disulfide_energy(&self) -> f32 {
+        const D0: f32 = 2.05; // Å, ideal S–S bond length
+        const SIGMA: f32 = 0.4;
+        const DEPTH: f32 = 4.0; // kcal/mol stabilization for a formed disulfide
+        const CUTOFF: f32 = 4.0; // Å, beyond this the well is negligible
+
+        let sg_positions: Vec<[f32; 3]> = (0..self.n_residues())
+            .filter_map(|r| self.sg_pos(r))
+            .collect();
+
+        let mut e = 0.0_f32;
+        for i in 0..sg_positions.len() {
+            for j in (i + 1)..sg_positions.len() {
+                let dx = sg_positions[i][0] - sg_positions[j][0];
+                let dy = sg_positions[i][1] - sg_positions[j][1];
+                let dz = sg_positions[i][2] - sg_positions[j][2];
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                if d > CUTOFF {
+                    continue;
+                }
+                let z = (d - D0) / SIGMA;
+                e -= DEPTH * (-0.5 * z * z).exp();
+            }
+        }
+        e
+    }
+
     /// Center of mass of Cα atoms.
     pub fn ca_center_of_mass(&self) -> [f32; 3] {
         let n = self.n_residues();
@@ -529,5 +573,66 @@ mod tests {
         prot.push_residue(AminoAcid::Gly, &backbone, [0.0; 4]);
         // GLY has 4 heavy atoms: N, CA, C, O
         assert_eq!(prot.n_atoms(), 4);
+    }
+
+    /// Only Cys residues expose an SG (sulfhydryl) atom.
+    #[test]
+    fn sg_pos_only_for_cysteine() {
+        let prot = protein_from_ca_trace(&[0.0], &[0.0], &[0.0], &[AminoAcid::Cys]);
+        assert!(prot.sg_pos(0).is_some());
+
+        let prot = protein_from_ca_trace(&[0.0], &[0.0], &[0.0], &[AminoAcid::Gly]);
+        assert!(prot.sg_pos(0).is_none());
+    }
+
+    /// A single Cys (no partner) has no pair to bond — energy is zero.
+    #[test]
+    fn disulfide_energy_zero_without_a_partner() {
+        let prot = protein_from_ca_trace(&[0.0], &[0.0], &[0.0], &[AminoAcid::Cys]);
+        assert_eq!(prot.disulfide_energy(), 0.0);
+    }
+
+    /// Two Cys residues placed far apart (CA trace 50 Å apart) have SG atoms
+    /// far beyond the 4 Å cutoff — energy must be exactly zero.
+    #[test]
+    fn disulfide_energy_zero_beyond_cutoff() {
+        let prot = protein_from_ca_trace(
+            &[0.0, 50.0], &[0.0, 0.0], &[0.0, 0.0],
+            &[AminoAcid::Cys, AminoAcid::Cys],
+        );
+        assert_eq!(prot.disulfide_energy(), 0.0);
+    }
+
+    /// `disulfide_energy` must equal the direct Gaussian-well sum over all
+    /// SG pairs — i.e. it must not silently diverge from its own definition.
+    #[test]
+    fn disulfide_energy_matches_pairwise_gaussian_sum() {
+        let prot = protein_from_ca_trace(
+            &[0.0, 3.8, 7.6], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0],
+            &[AminoAcid::Cys, AminoAcid::Cys, AminoAcid::Cys],
+        );
+
+        const D0: f32 = 2.05;
+        const SIGMA: f32 = 0.4;
+        const DEPTH: f32 = 4.0;
+        const CUTOFF: f32 = 4.0;
+
+        let sg: Vec<[f32; 3]> = (0..3).filter_map(|r| prot.sg_pos(r)).collect();
+        let mut expected = 0.0_f32;
+        for i in 0..sg.len() {
+            for j in (i + 1)..sg.len() {
+                let dx = sg[i][0] - sg[j][0];
+                let dy = sg[i][1] - sg[j][1];
+                let dz = sg[i][2] - sg[j][2];
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                if d > CUTOFF {
+                    continue;
+                }
+                let z = (d - D0) / SIGMA;
+                expected -= DEPTH * (-0.5 * z * z).exp();
+            }
+        }
+
+        assert!((prot.disulfide_energy() - expected).abs() < 1e-5);
     }
 }

@@ -4,6 +4,7 @@
 /// or full formula permits (LJ, hydrophobic).  Coulomb requires 1/r so sqrt
 /// is computed once per pair and reused.
 use crate::allatom::AtomCloud;
+use crate::amber::{HBOND_ACCEPTOR, HBOND_DONOR};
 use crate::atom::ResidueCloud;
 use crate::solvation;
 use crate::spatial::SpatialHashGrid;
@@ -18,6 +19,24 @@ const MIN_R_SQ: f32 = 0.25; // 0.5 Å — avoid singularity
 // Hydrophobic bonus cutoff (Å²)
 const HYDRO_CUTOFF_SQ: f32 = 36.0; // 6 Å
 const HYDRO_BONUS: f32 = -0.5; // kcal/mol per hydrophobic–hydrophobic pair
+
+// Hydrogen bond parameters (heavy-atom donor···acceptor distance, no angular term).
+const HB_R0: f32 = 2.9; // Å — ideal heavy-atom donor···acceptor separation
+const HB_SIGMA: f32 = 0.35; // Å — Gaussian width of the energy well
+const HB_DEPTH: f32 = 1.5; // kcal/mol per H-bond
+const HB_CUTOFF_SQ: f32 = 25.0; // 5 Å — beyond this the well is negligible
+
+/// Gaussian-well H-bond energy as a function of donor···acceptor distance².
+/// Heavy-atom approximation: no angular dependence since hydrogens aren't modelled.
+#[inline(always)]
+pub fn hbond_energy(r_sq: f32) -> f32 {
+    if r_sq > HB_CUTOFF_SQ {
+        return 0.0;
+    }
+    let r = r_sq.sqrt();
+    let z = (r - HB_R0) / HB_SIGMA;
+    -HB_DEPTH * (-0.5 * z * z).exp()
+}
 
 /// Combined Lennard-Jones energy for a residue pair using pre-squared distance.
 ///
@@ -42,6 +61,20 @@ fn coulomb_energy(q1: f32, q2: f32, r_sq: f32) -> f32 {
     COULOMB_K * q1 * q2 / r
 }
 
+/// Per-component breakdown of the coarse-grained interaction energy (kcal/mol).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResidueEnergyBreakdown {
+    pub lj: f32,
+    pub coulomb: f32,
+    pub hydrophobic: f32,
+}
+
+impl ResidueEnergyBreakdown {
+    pub fn total(&self) -> f32 {
+        self.lj + self.coulomb + self.hydrophobic
+    }
+}
+
 /// Total non-bonded interaction energy between antigen and antibody (kcal/mol).
 ///
 /// Fallback brute-force path (used for final scoring and testing).
@@ -50,10 +83,18 @@ fn coulomb_energy(q1: f32, q2: f32, r_sq: f32) -> f32 {
 /// (bx, by, bz, …) stays in registers, and there are no pointer aliasing
 /// concerns between antigen and antibody arrays.
 pub fn interaction_energy(antigen: &ResidueCloud, antibody: &ResidueCloud) -> f32 {
+    interaction_energy_breakdown(antigen, antibody).total()
+}
+
+/// Same as `interaction_energy` but returns the per-component breakdown.
+pub fn interaction_energy_breakdown(
+    antigen: &ResidueCloud,
+    antibody: &ResidueCloud,
+) -> ResidueEnergyBreakdown {
     let ag_n = antigen.len();
     let ab_n = antibody.len();
 
-    let mut total = 0.0_f32;
+    let mut b = ResidueEnergyBreakdown::default();
 
     for j in 0..ab_n {
         let bx = antibody.x[j];
@@ -80,21 +121,21 @@ pub fn interaction_energy(antigen: &ResidueCloud, antibody: &ResidueCloud) -> f3
             let sig_ij = 0.5 * (bs + antigen.sigma[i]);
             let sigma_sq_ij = sig_ij * sig_ij;
 
-            total += lj_energy(eps_ij, sigma_sq_ij, r_sq);
+            b.lj += lj_energy(eps_ij, sigma_sq_ij, r_sq);
 
             let q1 = bq;
             let q2 = antigen.charge[i];
             if q1 != 0.0 && q2 != 0.0 {
-                total += coulomb_energy(q1, q2, r_sq);
+                b.coulomb += coulomb_energy(q1, q2, r_sq);
             }
 
             if bh == 1 && antigen.hydrophobic[i] == 1 && r_sq < HYDRO_CUTOFF_SQ {
-                total += HYDRO_BONUS;
+                b.hydrophobic += HYDRO_BONUS;
             }
         }
     }
 
-    total
+    b
 }
 
 /// Compute force on every antibody atom due to all antigen atoms.
@@ -192,14 +233,38 @@ pub fn compute_forces(
     }
 }
 
+/// Per-component breakdown of the all-atom interaction energy (kcal/mol).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AtomEnergyBreakdown {
+    pub lj: f32,
+    pub coulomb: f32,
+    pub hydrophobic: f32,
+    pub hbond: f32,
+    pub solvation: f32,
+}
+
+impl AtomEnergyBreakdown {
+    pub fn total(&self) -> f32 {
+        self.lj + self.coulomb + self.hydrophobic + self.hbond + self.solvation
+    }
+}
+
 /// Total AMBER LJ + Coulomb + hydrophobic energy for all-atom clouds.
 ///
 /// Uses the AMBER convention V = ε[(R_ij/r)^12 − 2(R_ij/r)^6] where
 /// R_ij = r_min_half_i + r_min_half_j.
 pub fn interaction_energy_atoms(antigen: &AtomCloud, antibody: &AtomCloud) -> f32 {
+    interaction_energy_atoms_breakdown(antigen, antibody).total()
+}
+
+/// Same as `interaction_energy_atoms` but returns the per-component breakdown.
+pub fn interaction_energy_atoms_breakdown(
+    antigen: &AtomCloud,
+    antibody: &AtomCloud,
+) -> AtomEnergyBreakdown {
     let ag_n = antigen.len();
     let ab_n = antibody.len();
-    let mut total = 0.0_f32;
+    let mut b = AtomEnergyBreakdown::default();
 
     for j in 0..ab_n {
         let bx  = antibody.x[j];
@@ -223,23 +288,29 @@ pub fn interaction_energy_atoms(antigen: &AtomCloud, antibody: &AtomCloud) -> f3
             let r2   = (r_ij * r_ij) / r_sq;
             let r6   = r2 * r2 * r2;
             let r12  = r6 * r6;
-            total += eps * (r12 - 2.0 * r6);
+            b.lj += eps * (r12 - 2.0 * r6);
 
             let q1 = bq;
             let q2 = antigen.charge[i];
             if q1 != 0.0 && q2 != 0.0 {
-                total += COULOMB_K * q1 * q2 / r_sq.sqrt();
+                b.coulomb += COULOMB_K * q1 * q2 / r_sq.sqrt();
             }
 
             if bh == 1 && antigen.hydrophobic[i] == 1 && r_sq < HYDRO_CUTOFF_SQ {
-                total += HYDRO_BONUS;
+                b.hydrophobic += HYDRO_BONUS;
+            }
+
+            let bt = antibody.atom_type[j] as usize;
+            let at = antigen.atom_type[i] as usize;
+            if (HBOND_DONOR[bt] && HBOND_ACCEPTOR[at]) || (HBOND_ACCEPTOR[bt] && HBOND_DONOR[at]) {
+                b.hbond += hbond_energy(r_sq);
             }
         }
     }
 
     // EEF1 implicit solvation cross-term (burial free energy at the interface)
-    total += solvation::solvation_interaction(antigen, antibody);
-    total
+    b.solvation += solvation::solvation_interaction(antigen, antibody);
+    b
 }
 
 /// Grid-accelerated force computation using the antigen's SpatialHashGrid.
@@ -399,5 +470,39 @@ mod tests {
         let mut fz = vec![0.0f32; 1];
         compute_forces(&ag, &ab, &mut fx, &mut fy, &mut fz);
         assert!(fx[0] > 0.0, "expected LJ repulsion, got fx={}", fx[0]);
+    }
+
+    /// At the ideal donor···acceptor distance the H-bond well is at its deepest.
+    #[test]
+    fn hbond_energy_is_maximally_attractive_at_ideal_distance() {
+        let e_ideal = hbond_energy(HB_R0 * HB_R0);
+        assert!((e_ideal - (-HB_DEPTH)).abs() < 1e-5);
+    }
+
+    /// Energy must vanish beyond the cutoff and weaken monotonically with distance.
+    #[test]
+    fn hbond_energy_decays_with_distance() {
+        let e_near = hbond_energy(HB_R0 * HB_R0);
+        let e_far = hbond_energy((HB_R0 + 1.0) * (HB_R0 + 1.0));
+        let e_beyond_cutoff = hbond_energy(HB_CUTOFF_SQ + 1.0);
+
+        assert!(e_near < e_far, "energy should be more negative near r0");
+        assert_eq!(e_beyond_cutoff, 0.0);
+    }
+
+    /// Breakdown components must sum to the same total returned by the
+    /// monolithic `interaction_energy_atoms` (no double-counting / typos).
+    #[test]
+    fn atom_breakdown_sums_to_total() {
+        use crate::allatom::protein_from_ca_trace;
+        use crate::atom::AminoAcid as AA;
+
+        let ag = protein_from_ca_trace(&[0.0], &[0.0], &[0.0], &[AA::Asp]);
+        let ab = protein_from_ca_trace(&[3.0], &[0.0], &[0.0], &[AA::Lys]);
+
+        let total = interaction_energy_atoms(&ag.atoms, &ab.atoms);
+        let breakdown = interaction_energy_atoms_breakdown(&ag.atoms, &ab.atoms);
+
+        assert!((total - breakdown.total()).abs() < 1e-4);
     }
 }

@@ -103,3 +103,76 @@ pub fn is_interface(r: usize, ab: &AtomProtein, ag: &AtomProtein) -> bool {
         dx * dx + dy * dy + dz * dz < IFACE_SQ
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allatom::protein_from_ca_trace;
+    use crate::atom::AminoAcid;
+
+    fn protein(seq: &[AminoAcid], spacing: f32) -> AtomProtein {
+        let n = seq.len();
+        let xs: Vec<f32> = (0..n).map(|i| i as f32 * spacing).collect();
+        let ys = vec![0.0f32; n];
+        let zs = vec![0.0f32; n];
+        protein_from_ca_trace(&xs, &ys, &zs, seq)
+    }
+
+    /// Arg + Lys (+1 each) minus Asp + Glu (−1 each) nets to zero.
+    #[test]
+    fn net_charge_balances() {
+        use AminoAcid::*;
+        let ab = protein(&[Arg, Lys, Asp, Glu], 3.8);
+        let ag = protein(&[Gly], 3.8);
+
+        let q = SequenceQuality::assess(&ab, &ag);
+        assert_eq!(q.net_charge, 0);
+    }
+
+    /// Five consecutive hydrophobic residues should trigger the aggregation flag.
+    #[test]
+    fn long_hydrophobic_run_flags_aggregation() {
+        use AminoAcid::*;
+        let ab = protein(&[Leu, Ile, Val, Phe, Met], 3.8);
+        let ag = protein(&[Gly], 3.8);
+
+        let q = SequenceQuality::assess(&ab, &ag);
+        assert_eq!(q.max_hydro_run, 5);
+        assert!(q.aggregation_risk);
+    }
+
+    /// A polar/charged sequence with no hydrophobic run should not be flagged.
+    #[test]
+    fn polar_sequence_is_not_aggregation_prone() {
+        use AminoAcid::*;
+        let ab = protein(&[Asp, Lys, Glu, Arg], 3.8);
+        let ag = protein(&[Gly], 3.8);
+
+        let q = SequenceQuality::assess(&ab, &ag);
+        assert!(!q.aggregation_risk);
+    }
+
+    /// A residue placed right on top of the antigen is interface; one placed
+    /// far away (well beyond the 8 Å cutoff) is framework.
+    #[test]
+    fn interface_detection_uses_distance_cutoff() {
+        use AminoAcid::*;
+        let ab = protein(&[Gly, Gly], 100.0); // second residue is 100 Å away
+        let ag = protein(&[Gly], 3.8);
+
+        let labels = SequenceQuality::interface_labels(&ab, &ag);
+        assert_eq!(labels.chars().next(), Some('I'));
+        assert_eq!(labels.chars().nth(1), Some('F'));
+    }
+
+    /// Entropy penalty must always exceed the base translational/rotational term.
+    #[test]
+    fn entropy_penalty_is_at_least_base() {
+        use AminoAcid::*;
+        let ab = protein(&[Trp, Arg], 3.8);
+        let ag = protein(&[Gly], 3.8);
+
+        let q = SequenceQuality::assess(&ab, &ag);
+        assert!(q.entropy_penalty >= BASE_ENTROPY);
+    }
+}

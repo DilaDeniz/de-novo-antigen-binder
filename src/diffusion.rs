@@ -18,6 +18,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use crate::allatom::{protein_from_ca_trace, AtomProtein};
+use crate::amber::{HBOND_ACCEPTOR, HBOND_DONOR};
 use crate::atom::{AminoAcid, ResidueCloud, AA_COUNT};
 use crate::energy;
 use crate::rotamer::rotamers;
@@ -189,12 +190,20 @@ fn single_residue_energy(j: usize, antibody: &ResidueCloud, antigen: &ResidueClo
 
 // ── Coarse-grained public interface ──────────────────────────────────────────
 
-pub fn run(antigen: &ResidueCloud, ab_length: usize) -> DiffusionResult {
+/// Run the coarse-grained diffusion engine, returning the `top_n` lowest-energy
+/// candidates (sorted ascending) out of `population` independent trajectories.
+pub fn run(
+    antigen: &ResidueCloud,
+    ab_length: usize,
+    population: usize,
+    iterations: usize,
+    top_n: usize,
+) -> Vec<DiffusionResult> {
     let center = antigen.center_of_mass();
     let mut grid = SpatialHashGrid::new(10.0);
     grid.build(&antigen.x, &antigen.y, &antigen.z);
 
-    let best = (0..POPULATION)
+    let mut results: Vec<(ResidueCloud, f32)> = (0..population)
         .into_par_iter()
         .map(|seed| {
             let mut rng = SmallRng::seed_from_u64(seed_u64(seed));
@@ -202,20 +211,26 @@ pub fn run(antigen: &ResidueCloud, ab_length: usize) -> DiffusionResult {
             let mut fx_buf = Vec::with_capacity(ab_length);
             let mut fy_buf = Vec::with_capacity(ab_length);
             let mut fz_buf = Vec::with_capacity(ab_length);
-            for iter in 0..ITERATIONS {
-                let temp = temperature(iter, ITERATIONS);
+            for iter in 0..iterations {
+                let temp = temperature(iter, iterations);
                 diffusion_step(&mut antibody, antigen, &grid, center, temp, &mut rng,
                                &mut fx_buf, &mut fy_buf, &mut fz_buf);
             }
             let e = energy::interaction_energy(antigen, &antibody);
             (antibody, e)
         })
-        .reduce_with(|a, b| if a.1 <= b.1 { a } else { b })
-        .expect("population is non-empty");
+        .collect();
 
-    let (antibody, energy) = best;
-    let sequence = antibody.sequence();
-    DiffusionResult { antibody, energy, sequence }
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(top_n.max(1));
+
+    results
+        .into_iter()
+        .map(|(antibody, energy)| {
+            let sequence = antibody.sequence();
+            DiffusionResult { antibody, energy, sequence }
+        })
+        .collect()
 }
 
 // ── All-atom helpers ──────────────────────────────────────────────────────────
@@ -236,9 +251,10 @@ fn random_allatom_antibody(n: usize, center: [f32; 3], rng: &mut SmallRng) -> At
     protein_from_ca_trace(&xs, &ys, &zs, &aas)
 }
 
-/// Compute total AMBER LJ + Coulomb + hydrophobic energy between two AtomProteins.
+/// Compute total AMBER LJ + Coulomb + H-bond + hydrophobic + solvation energy
+/// between two AtomProteins, plus the antibody's intramolecular disulfide term.
 fn allatom_energy(ag: &AtomProtein, ab: &AtomProtein) -> f32 {
-    energy::interaction_energy_atoms(&ag.atoms, &ab.atoms)
+    energy::interaction_energy_atoms(&ag.atoms, &ab.atoms) + ab.disulfide_energy()
 }
 
 /// Gradient + noise step on the Cα positions only, then rebuild side-chains.
@@ -327,9 +343,9 @@ fn allatom_diffusion_step(
                     let rot_idx = rng.gen_range(0..rots.len());
                     let new_rot = rots[rot_idx];
 
-                    let old_e = residue_contribution_allatom(r, ab, ag);
+                    let old_e = residue_contribution_allatom(r, ab, ag) + ab.disulfide_energy();
                     ab.apply_rotamer(r, &new_rot);
-                    let new_e = residue_contribution_allatom(r, ab, ag);
+                    let new_e = residue_contribution_allatom(r, ab, ag) + ab.disulfide_energy();
                     let delta_e = new_e - old_e;
                     let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                     if !accept {
@@ -343,11 +359,11 @@ fn allatom_diffusion_step(
                 let new_aa  = AminoAcid::from_index(rng.gen_range(0..AA_COUNT));
                 let old_chi = ab.chi[r];
 
-                let old_e = residue_contribution_allatom(r, ab, ag);
+                let old_e = residue_contribution_allatom(r, ab, ag) + ab.disulfide_energy();
                 let rots = rotamers(new_aa);
                 let new_chi = if rots.is_empty() { [0.0f32; 4] } else { rots[0].chi };
                 ab.mutate_residue(r, new_aa, new_chi);
-                let new_e = residue_contribution_allatom(r, ab, ag);
+                let new_e = residue_contribution_allatom(r, ab, ag) + ab.disulfide_energy();
                 let delta_e = new_e - old_e;
                 let accept = delta_e <= 0.0 || rng.gen::<f32>() < (-delta_e / temp).exp();
                 if !accept {
@@ -363,9 +379,11 @@ fn allatom_diffusion_step(
         if rng.gen::<f32>() < BACKBONE_MOVE_P {
             let delta = rng.gen_range(-MAX_TORSION_DEG..MAX_TORSION_DEG).to_radians();
             let do_phi = rng.gen::<bool>();
-            let old_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum();
+            let old_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum::<f32>()
+                + ab.disulfide_energy();
             if do_phi { ab.perturb_phi(r, delta); } else { ab.perturb_psi(r, delta); }
-            let new_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum();
+            let new_e: f32 = (r..n).map(|i| residue_contribution_allatom(i, ab, ag)).sum::<f32>()
+                + ab.disulfide_energy();
             let accept = (new_e - old_e) <= 0.0
                 || rng.gen::<f32>() < (-(new_e - old_e) / temp).exp();
             if !accept {
@@ -386,6 +404,7 @@ fn residue_contribution_allatom(r: usize, ab: &AtomProtein, ag: &AtomProtein) ->
     let be    = ab.atoms.epsilon[ab_ca];
     let bq    = ab.atoms.charge[ab_ca];
     let bh    = ab.atoms.hydrophobic[ab_ca];
+    let bt    = ab.atoms.atom_type[ab_ca] as usize;
     let mut e = 0.0_f32;
     for i in 0..ag.n_residues() {
         let ag_ca = ag.ca_atom_idx[i] as usize;
@@ -399,6 +418,7 @@ fn residue_contribution_allatom(r: usize, ab: &AtomProtein, ag: &AtomProtein) ->
         let ae   = ag.atoms.epsilon[ag_ca];
         let aq   = ag.atoms.charge[ag_ca];
         let ah   = ag.atoms.hydrophobic[ag_ca];
+        let at   = ag.atoms.atom_type[ag_ca] as usize;
         let r_ij = brm + arm;
         let eps  = (be * ae).sqrt();
         let r2   = (r_ij * r_ij) / r_sq;
@@ -410,22 +430,30 @@ fn residue_contribution_allatom(r: usize, ab: &AtomProtein, ag: &AtomProtein) ->
         if bh == 1 && ah == 1 && r_sq < 36.0 {
             e -= 0.5;
         }
+        if (HBOND_DONOR[bt] && HBOND_ACCEPTOR[at]) || (HBOND_ACCEPTOR[bt] && HBOND_DONOR[at]) {
+            e += energy::hbond_energy(r_sq);
+        }
     }
     e
 }
 
 // ── All-atom public interface ─────────────────────────────────────────────────
 
-/// Run the all-atom hybrid diffusion engine.
+/// Run the all-atom hybrid diffusion engine, returning the `top_n` lowest-energy
+/// candidates (sorted ascending).
 ///
 /// If a GPU context is provided, runs 1024-candidate GPU broad-sampling first
-/// (gradient-only, 200 steps), then refines the top-64 with CPU Langevin +
-/// rotamer MC (600 steps).  Without GPU, runs 64 candidates × 800 CPU steps.
+/// (gradient-only, 200 steps), then refines the top `population` with CPU
+/// Langevin + rotamer MC (`cpu_iterations` steps).  Without GPU, runs
+/// `population` candidates × `cpu_iterations` CPU steps directly.
 pub fn run_allatom(
     antigen: &AtomProtein,
     ab_length: usize,
+    population: usize,
+    cpu_iterations: usize,
+    top_n: usize,
     #[cfg(feature = "gpu")] gpu: Option<&crate::gpu::GpuContext>,
-) -> AllAtomResult {
+) -> Vec<AllAtomResult> {
     let center = antigen.ca_center_of_mass();
 
     // Pre-compute antigen Cα cloud and grid once; shared read-only across all steps.
@@ -454,14 +482,14 @@ pub fn run_allatom(
 
         // GPU gradient steps
         for iter in 0..GPU_STEPS {
-            let temp = temperature(iter, GPU_STEPS + CPU_STEPS);
+            let temp = temperature(iter, GPU_STEPS + cpu_iterations);
             // Move each candidate with gradient (no noise, no MC) in parallel
             all_cands.par_iter_mut().enumerate().for_each(|(seed, ab)| {
                 let mut rng = SmallRng::seed_from_u64(seed_u64(seed + iter * AA_POPULATION));
                 allatom_diffusion_step(ab, antigen, &ag_ca, &ag_ca_grid, center, temp, &mut rng, false);
             });
 
-            // Score and prune to TOP_K once at the end of the GPU phase
+            // Score and prune to `population` once at the end of the GPU phase
             if iter == GPU_STEPS - 1 {
                 let n_ab = all_cands[0].n_atoms();
                 let gpu_atoms: Vec<crate::gpu::GpuAtom> = all_cands.iter().flat_map(|ab| {
@@ -479,13 +507,13 @@ pub fn run_allatom(
 
                 let energies = gpu_ctx.score_batch(&antigen.atoms, &gpu_atoms, n_ab);
 
-                // Keep only TOP_K lowest-energy candidates
+                // Keep only the `population` lowest-energy candidates
                 let mut indexed: Vec<(usize, f32)> = energies.into_iter().enumerate().collect();
                 indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                indexed.truncate(TOP_K);
+                indexed.truncate(population);
                 let keep_idxs: Vec<usize> = indexed.into_iter().map(|(i, _)| i).collect();
 
-                let mut survivors_tmp: Vec<AtomProtein> = Vec::with_capacity(TOP_K);
+                let mut survivors_tmp: Vec<AtomProtein> = Vec::with_capacity(population);
                 for idx in keep_idxs {
                     // Move the protein out; fill hole with default (will be overwritten or dropped)
                     let placeholder = AtomProtein::new();
@@ -495,12 +523,12 @@ pub fn run_allatom(
                 all_cands = survivors_tmp;
             }
         }
-        // Ensure exactly TOP_K
-        all_cands.truncate(TOP_K);
+        // Ensure exactly `population`
+        all_cands.truncate(population);
         all_cands
     } else {
-        // No GPU: create TOP_K candidates for CPU-only path
-        (0..TOP_K)
+        // No GPU: create `population` candidates for CPU-only path
+        (0..population)
             .map(|seed| {
                 let mut rng = SmallRng::seed_from_u64(seed_u64(seed));
                 random_allatom_antibody(ab_length, center, &mut rng)
@@ -508,9 +536,9 @@ pub fn run_allatom(
             .collect()
     };
 
-    // When compiled without GPU feature, always create TOP_K candidates directly
+    // When compiled without GPU feature, always create `population` candidates directly
     #[cfg(not(feature = "gpu"))]
-    let survivors: Vec<AtomProtein> = (0..TOP_K)
+    let survivors: Vec<AtomProtein> = (0..population)
         .map(|seed| {
             let mut rng = SmallRng::seed_from_u64(seed_u64(seed));
             random_allatom_antibody(ab_length, center, &mut rng)
@@ -518,22 +546,28 @@ pub fn run_allatom(
         .collect();
 
     // ── CPU refinement phase (Rayon over survivors) ───────────────────────────
-    let best = survivors
+    let mut results: Vec<(AtomProtein, f32)> = survivors
         .into_par_iter()
         .enumerate()
         .map(|(seed, mut ab)| {
             let mut rng = SmallRng::seed_from_u64(seed_u64(seed + 999_999));
-            for iter in 0..CPU_STEPS {
-                let temp = temperature(iter, CPU_STEPS);
+            for iter in 0..cpu_iterations {
+                let temp = temperature(iter, cpu_iterations);
                 allatom_diffusion_step(&mut ab, antigen, &ag_ca, &ag_ca_grid, center, temp, &mut rng, true);
             }
             let e = allatom_energy(antigen, &ab);
             (ab, e)
         })
-        .reduce_with(|a, b| if a.1 <= b.1 { a } else { b })
-        .expect("survivors non-empty");
+        .collect();
 
-    let (antibody, energy) = best;
-    let sequence = antibody.sequence();
-    AllAtomResult { antibody, energy, sequence }
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(top_n.max(1));
+
+    results
+        .into_iter()
+        .map(|(antibody, energy)| {
+            let sequence = antibody.sequence();
+            AllAtomResult { antibody, energy, sequence }
+        })
+        .collect()
 }

@@ -62,6 +62,27 @@ pub static AMBER_NB: [AmberNbParams; N_ATOM_TYPES] = [
     AmberNbParams { r_min_half: 2.0000, epsilon: 0.2500 }, // SH
 ];
 
+// ── Hydrogen-bond donor/acceptor classification ──────────────────────────────
+//
+// Heavy-atom-only approximation (no explicit H positions): an atom is a donor
+// if it normally carries a polar H (backbone amide N, guanidinium/amino N,
+// hydroxyl/thiol O/S), and an acceptor if it carries a lone pair available for
+// H-bonding (carbonyl/carboxylate/ether O, neutral aromatic N). OH is both.
+// Indexed by `AtomType as usize`, matching AMBER_NB/EEF1.
+pub static HBOND_DONOR: [bool; N_ATOM_TYPES] = [
+    false, false, false, false, false, // C, CA, CB, CC, CT
+    true, true, true, true, false, // N, N2, N3, NA, NB
+    false, false, true, false, // O, O2, OH, OS
+    false, true, // S, SH
+];
+
+pub static HBOND_ACCEPTOR: [bool; N_ATOM_TYPES] = [
+    false, false, false, false, false, // C, CA, CB, CC, CT
+    false, false, false, false, true, // N, N2, N3, NA, NB
+    true, true, true, true, // O, O2, OH, OS
+    false, false, // S, SH
+];
+
 // ── Per-residue atom lists ────────────────────────────────────────────────────
 
 /// A single heavy atom within a residue.

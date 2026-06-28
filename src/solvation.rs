@@ -17,6 +17,7 @@
 /// seamlessly included in every force-field energy evaluation.
 use crate::amber::{Eef1Params, EEF1};
 use crate::allatom::AtomCloud;
+use rayon::prelude::*;
 
 // π^(3/2) pre-computed
 const PI32: f32 = 5.568_328; // π^(3/2)
@@ -51,29 +52,35 @@ fn pair_solvation(ei: &Eef1Params, ej: &Eef1Params, r_sq: f32) -> f32 {
 pub fn solvation_interaction(ag: &AtomCloud, ab: &AtomCloud) -> f32 {
     let ag_n = ag.len();
     let ab_n = ab.len();
-    let mut total = 0.0_f32;
 
-    for j in 0..ab_n {
-        let bx = ab.x[j];
-        let by = ab.y[j];
-        let bz = ab.z[j];
-        let ej = &EEF1[ab.atom_type[j] as usize];
-        if ej.vol == 0.0 && ej.dg_ref == 0.0 { continue; }
+    (0..ab_n)
+        .into_par_iter()
+        .map(|j| {
+            let bx = ab.x[j];
+            let by = ab.y[j];
+            let bz = ab.z[j];
+            let ej = &EEF1[ab.atom_type[j] as usize];
+            if ej.vol == 0.0 && ej.dg_ref == 0.0 {
+                return 0.0;
+            }
 
-        for i in 0..ag_n {
-            let dx   = bx - ag.x[i];
-            let dy   = by - ag.y[i];
-            let dz   = bz - ag.z[i];
-            let r_sq = dx*dx + dy*dy + dz*dz;
+            let mut local = 0.0_f32;
+            for i in 0..ag_n {
+                let dx = bx - ag.x[i];
+                let dy = by - ag.y[i];
+                let dz = bz - ag.z[i];
+                let r_sq = dx * dx + dy * dy + dz * dz;
 
-            if r_sq >= SOLV_CUTOFF_SQ || r_sq < 0.25 { continue; }
+                if r_sq >= SOLV_CUTOFF_SQ || r_sq < 0.25 {
+                    continue;
+                }
 
-            let ei = &EEF1[ag.atom_type[i] as usize];
-            total += pair_solvation(ei, ej, r_sq);
-        }
-    }
-
-    total
+                let ei = &EEF1[ag.atom_type[i] as usize];
+                local += pair_solvation(ei, ej, r_sq);
+            }
+            local
+        })
+        .sum()
 }
 
 #[cfg(test)]
