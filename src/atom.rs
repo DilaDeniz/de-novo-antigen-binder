@@ -149,6 +149,33 @@ impl AminoAcid {
             _ => AminoAcid::Gly,
         }
     }
+
+    /// Parse a one-letter FASTA code. Returns `None` for unrecognized letters.
+    pub fn from_char(c: char) -> Option<Self> {
+        Some(match c.to_ascii_uppercase() {
+            'A' => AminoAcid::Ala,
+            'R' => AminoAcid::Arg,
+            'N' => AminoAcid::Asn,
+            'D' => AminoAcid::Asp,
+            'C' => AminoAcid::Cys,
+            'Q' => AminoAcid::Gln,
+            'E' => AminoAcid::Glu,
+            'G' => AminoAcid::Gly,
+            'H' => AminoAcid::His,
+            'I' => AminoAcid::Ile,
+            'L' => AminoAcid::Leu,
+            'K' => AminoAcid::Lys,
+            'M' => AminoAcid::Met,
+            'F' => AminoAcid::Phe,
+            'P' => AminoAcid::Pro,
+            'S' => AminoAcid::Ser,
+            'T' => AminoAcid::Thr,
+            'W' => AminoAcid::Trp,
+            'Y' => AminoAcid::Tyr,
+            'V' => AminoAcid::Val,
+            _ => return None,
+        })
+    }
 }
 
 /// Residue-level protein representation using Structure-of-Arrays layout.

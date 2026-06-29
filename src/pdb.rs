@@ -83,30 +83,7 @@ pub fn parse_peptide(seq: &str) -> Result<ResidueCloud, BinderError> {
 }
 
 fn aa_from_char(c: char) -> Option<AminoAcid> {
-    let aa = match c.to_ascii_uppercase() {
-        'A' => AminoAcid::Ala,
-        'R' => AminoAcid::Arg,
-        'N' => AminoAcid::Asn,
-        'D' => AminoAcid::Asp,
-        'C' => AminoAcid::Cys,
-        'Q' => AminoAcid::Gln,
-        'E' => AminoAcid::Glu,
-        'G' => AminoAcid::Gly,
-        'H' => AminoAcid::His,
-        'I' => AminoAcid::Ile,
-        'L' => AminoAcid::Leu,
-        'K' => AminoAcid::Lys,
-        'M' => AminoAcid::Met,
-        'F' => AminoAcid::Phe,
-        'P' => AminoAcid::Pro,
-        'S' => AminoAcid::Ser,
-        'T' => AminoAcid::Thr,
-        'W' => AminoAcid::Trp,
-        'Y' => AminoAcid::Tyr,
-        'V' => AminoAcid::Val,
-        _ => return None,
-    };
-    Some(aa)
+    AminoAcid::from_char(c)
 }
 
 // ── PDB writer ────────────────────────────────────────────────────────────────
@@ -169,6 +146,45 @@ pub fn write_pdb_allatom(prot: &AtomProtein, chain_id: char) -> String {
                 prot.atoms.z[atom_idx],
             );
         }
+    }
+    let _ = write!(out, "END\n");
+    out
+}
+
+/// Serialise multiple `AtomProtein` chains into one PDB file, each chain
+/// getting its own chain ID and a continuous atom serial numbering, with a
+/// `TER` record separating chains (e.g. heavy 'H' + light 'L' for an Fv).
+pub fn write_pdb_multi(chains: &[(&AtomProtein, char)]) -> String {
+    let total_atoms: usize = chains.iter().map(|(p, _)| p.n_atoms()).sum();
+    let mut out = String::with_capacity(total_atoms * 80);
+    let mut serial = 0usize;
+
+    for (prot, chain_id) in chains {
+        for r in 0..prot.n_residues() {
+            let aa      = prot.amino_acid[r];
+            let topo    = topology(aa);
+            let range   = prot.atom_range(r);
+            let res_seq = (r + 1).min(9_999);
+
+            for (k, atom_idx) in range.enumerate() {
+                if k >= topo.atoms.len() { break; }
+                serial += 1;
+                let atom_name = topo.atoms[k].name;
+                let _ = write!(
+                    out,
+                    "ATOM  {:5} {:<4} {:3} {:1}{:4}    {:8.3}{:8.3}{:8.3}  1.00  0.00           C\n",
+                    serial.min(99_999),
+                    atom_name,
+                    aa.three_letter(),
+                    chain_id,
+                    res_seq,
+                    prot.atoms.x[atom_idx],
+                    prot.atoms.y[atom_idx],
+                    prot.atoms.z[atom_idx],
+                );
+            }
+        }
+        let _ = write!(out, "TER\n");
     }
     let _ = write!(out, "END\n");
     out

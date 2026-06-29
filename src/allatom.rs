@@ -13,6 +13,7 @@ use crate::rotamer::{build_side_chain, rotamers, Rotamer};
 // ── AtomCloud ─────────────────────────────────────────────────────────────────
 
 /// Flat all-atom SoA.  All Vecs have length `n_atoms`.
+#[derive(Clone)]
 pub struct AtomCloud {
     pub x:          Vec<f32>,
     pub y:          Vec<f32>,
@@ -87,6 +88,7 @@ impl Default for AtomCloud {
 /// All-atom protein with residue bookkeeping.
 ///
 /// `atoms.x[ranges[i].clone()]` gives the x-coordinates for residue i.
+#[derive(Clone)]
 pub struct AtomProtein {
     pub atoms: AtomCloud,
     /// Byte ranges into `atoms` per residue: atoms[ranges[i]..ranges[i+1]].
@@ -476,12 +478,12 @@ pub fn rodrigues(point: [f32; 3], origin: [f32; 3], axis: [f32; 3], angle: f32) 
     add3(rotd, origin)
 }
 
-#[inline(always)] fn sub3(a:[f32;3], b:[f32;3]) -> [f32;3] { [a[0]-b[0],a[1]-b[1],a[2]-b[2]] }
+#[inline(always)] pub(crate) fn sub3(a:[f32;3], b:[f32;3]) -> [f32;3] { [a[0]-b[0],a[1]-b[1],a[2]-b[2]] }
 #[inline(always)] fn add3(a:[f32;3], b:[f32;3]) -> [f32;3] { [a[0]+b[0],a[1]+b[1],a[2]+b[2]] }
-#[inline(always)] fn cross3(a:[f32;3], b:[f32;3]) -> [f32;3] {
+#[inline(always)] pub(crate) fn cross3(a:[f32;3], b:[f32;3]) -> [f32;3] {
     [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
 }
-#[inline(always)] fn norm3(v:[f32;3]) -> [f32;3] {
+#[inline(always)] pub(crate) fn norm3(v:[f32;3]) -> [f32;3] {
     let l = (v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt().max(1e-8);
     [v[0]/l, v[1]/l, v[2]/l]
 }
